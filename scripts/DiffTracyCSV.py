@@ -15,7 +15,7 @@ Changes = namedtuple("Changes", ["zone", "measures"])
 
 
 def read_file(filename):
-    data = dict()
+    data = {}
     with open(filename, newline='', encoding='utf-8') as f:
         reader = csv.reader(f)
         next(reader, None)  # skip header
