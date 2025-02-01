@@ -18,7 +18,7 @@ using namespace stellar::InvariantTestUtils;
 TEST_CASE("sponsorship invariant", "[invariant][sponsorshipcountisvalid]")
 {
     VirtualClock clock;
-    Config cfg = getTestConfig(0);
+    Config cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
     cfg.INVARIANT_CHECKS = {"SponsorshipCountIsValid"};
     auto app = createTestApplication(clock, cfg);
 
@@ -73,10 +73,10 @@ TEST_CASE("sponsorship invariant", "[invariant][sponsorshipcountisvalid]")
                 LedgerTestUtils::generateValidClaimableBalanceEntry();
             break;
         case LIQUIDITY_POOL:
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
         case CONTRACT_DATA:
         case CONFIG_SETTING:
-#endif
+        case CONTRACT_CODE:
+        case TTL:
         default:
             abort();
         }

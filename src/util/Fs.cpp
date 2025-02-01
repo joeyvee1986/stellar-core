@@ -8,6 +8,7 @@
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include <Tracy.hpp>
+#include <cstdint>
 #include <filesystem>
 #include <fmt/format.h>
 
@@ -152,7 +153,8 @@ durableRename(std::string const& src, std::string const& dst,
               std::string const& dir)
 {
     ZoneScoped;
-    if (MoveFileExA(src.c_str(), dst.c_str(), MOVEFILE_WRITE_THROUGH) == 0)
+    if (MoveFileExA(src.c_str(), dst.c_str(),
+                    MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING) == 0)
     {
         FileSystemException::failWithGetLastError(
             "fs::durableRename() failed on MoveFileExA(): ");
@@ -256,7 +258,9 @@ durableRename(std::string const& src, std::string const& dst,
               std::string const& dir)
 {
     ZoneScoped;
-    if (rename(src.c_str(), dst.c_str()) != 0)
+    std::error_code ec;
+    std::filesystem::rename(src.c_str(), dst.c_str(), ec);
+    if (ec)
     {
         return false;
     }
@@ -427,8 +431,8 @@ size(std::string const& filename)
 
 #ifdef _WIN32
 
-int
-getMaxConnections()
+int64_t
+getMaxHandles()
 {
     // on Windows, there is no limit on handles
     // only limits based on ephemeral ports, etc
@@ -436,8 +440,8 @@ getMaxConnections()
 }
 
 #else
-int
-getMaxConnections()
+int64_t
+getMaxHandles()
 {
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
@@ -449,5 +453,55 @@ getMaxConnections()
     return 64;
 }
 #endif
+
+#if defined(_WIN32)
+int64_t
+getOpenHandleCount()
+{
+    HANDLE proc =
+        OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, GetCurrentProcessId());
+    if (proc)
+    {
+        DWORD count{0};
+        if (GetProcessHandleCount(proc, &count))
+        {
+            return static_cast<int64_t>(count);
+        }
+        CloseHandle(proc);
+    }
+    return 0;
+}
+#elif defined(__APPLE__)
+int64_t
+getOpenHandleCount()
+{
+    int64_t n{0};
+    for (auto const& _fd : std::filesystem::directory_iterator("/dev/fd"))
+    {
+        std::ignore = _fd;
+        ++n;
+    }
+    return n;
+}
+#elif defined(__linux__)
+int64_t
+getOpenHandleCount()
+{
+    int64_t n{0};
+    for (auto const& _fd : std::filesystem::directory_iterator("/proc/self/fd"))
+    {
+        std::ignore = _fd;
+        ++n;
+    }
+    return n;
+}
+#else
+int64_t
+getOpenHandleCount()
+{
+    return 0;
+}
+#endif
+
 }
 }

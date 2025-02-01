@@ -4,18 +4,21 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_set>
 
 namespace stellar
 {
 
-class Bucket;
+class LiveBucket;
 enum LedgerEntryType : std::int32_t;
 struct LedgerTxnDelta;
 struct Operation;
 struct OperationResult;
+struct LedgerKey;
 
 // NOTE: The checkOn* functions should have a default implementation so that
 //       more can be added in the future without requiring changes to all
@@ -42,9 +45,15 @@ class Invariant
     }
 
     virtual std::string
-    checkOnBucketApply(std::shared_ptr<Bucket const> bucket,
+    checkOnBucketApply(std::shared_ptr<LiveBucket const> bucket,
                        uint32_t oldestLedger, uint32_t newestLedger,
-                       std::function<bool(LedgerEntryType)> entryTypeFilter)
+                       std::unordered_set<LedgerKey> const& shadowedKeys)
+    {
+        return std::string{};
+    }
+
+    virtual std::string
+    checkAfterAssumeState(uint32_t newestLedger)
     {
         return std::string{};
     }

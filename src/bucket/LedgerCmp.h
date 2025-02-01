@@ -6,11 +6,14 @@
 
 #include <type_traits>
 
-#include "overlay/StellarXDR.h"
-#include "util/XDROperators.h"
+#include "bucket/BucketUtils.h"
+#include "util/XDROperators.h" // IWYU pragma: keep
+#include "xdr/Stellar-ledger-entries.h"
 
 namespace stellar
 {
+class HotArchiveBucket;
+class LiveBucket;
 
 template <typename T>
 bool
@@ -84,13 +87,15 @@ struct LedgerEntryIdCmp
         case LIQUIDITY_POOL:
             return a.liquidityPool().liquidityPoolID <
                    b.liquidityPool().liquidityPoolID;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
         case CONTRACT_DATA:
-            return lexCompare(a.contractData().contractID,
-                              b.contractData().contractID, a.contractData().key,
-                              b.contractData().key);
+        {
+            return lexCompare(a.contractData().contract,
+                              b.contractData().contract, a.contractData().key,
+                              b.contractData().key, a.contractData().durability,
+                              b.contractData().durability);
+        }
         case CONTRACT_CODE:
-            return a.contractCode().hash < b.contractCode().hash;
+            return lexCompare(a.contractCode().hash, b.contractCode().hash);
         case CONFIG_SETTING:
         {
             auto getConfigSettingId = [](auto const& v) -> ConfigSettingID {
@@ -104,11 +109,15 @@ struct LedgerEntryIdCmp
                 {
                     return v.configSetting().configSettingID();
                 }
-                throw std::runtime_error("Unexpected entry type");
+                else
+                {
+                    throw std::runtime_error("Unexpected entry type");
+                }
             };
             return getConfigSettingId(a) < getConfigSettingId(b);
         }
-#endif
+        case TTL:
+            return lexCompare(a.ttl().keyHash, b.ttl().keyHash);
         }
         return false;
     }
@@ -119,10 +128,66 @@ struct LedgerEntryIdCmp
  * LedgerEntries (ignoring their hashes, as the LedgerEntryIdCmp ignores their
  * bodies).
  */
-struct BucketEntryIdCmp
+template <typename BucketT> struct BucketEntryIdCmp
 {
+    BUCKET_TYPE_ASSERT(BucketT);
+
     bool
-    operator()(BucketEntry const& a, BucketEntry const& b) const
+    compareHotArchive(HotArchiveBucketEntry const& a,
+                      HotArchiveBucketEntry const& b) const
+    {
+        HotArchiveBucketEntryType aty = a.type();
+        HotArchiveBucketEntryType bty = b.type();
+
+        // METAENTRY sorts below all other entries, comes first in buckets.
+        if (aty == HOT_ARCHIVE_METAENTRY || bty == HOT_ARCHIVE_METAENTRY)
+        {
+            return aty < bty;
+        }
+
+        if (aty == HOT_ARCHIVE_ARCHIVED)
+        {
+            if (bty == HOT_ARCHIVE_ARCHIVED)
+            {
+                return LedgerEntryIdCmp{}(a.archivedEntry().data,
+                                          b.archivedEntry().data);
+            }
+            else
+            {
+                if (bty != HOT_ARCHIVE_DELETED && bty != HOT_ARCHIVE_LIVE)
+                {
+                    throw std::runtime_error("Malformed bucket: expected "
+                                             "DELETED/LIVE key.");
+                }
+                return LedgerEntryIdCmp{}(a.archivedEntry().data, b.key());
+            }
+        }
+        else
+        {
+            if (aty != HOT_ARCHIVE_DELETED && aty != HOT_ARCHIVE_LIVE)
+            {
+                throw std::runtime_error(
+                    "Malformed bucket: expected DELETED/LIVE key.");
+            }
+
+            if (bty == HOT_ARCHIVE_ARCHIVED)
+            {
+                return LedgerEntryIdCmp{}(a.key(), b.archivedEntry().data);
+            }
+            else
+            {
+                if (bty != HOT_ARCHIVE_DELETED && bty != HOT_ARCHIVE_LIVE)
+                {
+                    throw std::runtime_error("Malformed bucket: expected "
+                                             "DELETED/RESTORED key.");
+                }
+                return LedgerEntryIdCmp{}(a.key(), b.key());
+            }
+        }
+    }
+
+    bool
+    compareLive(BucketEntry const& a, BucketEntry const& b) const
     {
         BucketEntryType aty = a.type();
         BucketEntryType bty = b.type();
@@ -170,6 +235,20 @@ struct BucketEntryIdCmp
                 }
                 return LedgerEntryIdCmp{}(a.deadEntry(), b.deadEntry());
             }
+        }
+    }
+
+    bool
+    operator()(typename BucketT::EntryT const& a,
+               typename BucketT::EntryT const& b) const
+    {
+        if constexpr (std::is_same_v<BucketT, LiveBucket>)
+        {
+            return compareLive(a, b);
+        }
+        else
+        {
+            return compareHotArchive(a, b);
         }
     }
 };

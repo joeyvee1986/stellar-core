@@ -15,19 +15,24 @@ class SignatureChecker;
 
 class FeeBumpTransactionFrame : public TransactionFrameBase
 {
-    TransactionEnvelope mEnvelope;
-    TransactionResult mResult;
-
-    TransactionFramePtr mInnerTx;
+#ifdef BUILD_TESTS
+    mutable
+#else
+    const
+#endif
+        TransactionEnvelope mEnvelope;
+    TransactionFramePtr const mInnerTx;
 
     Hash const& mNetworkID;
     mutable Hash mContentsHash;
     mutable Hash mFullHash;
 
     bool checkSignature(SignatureChecker& signatureChecker,
-                        LedgerTxnEntry const& account, int32_t neededWeight);
+                        LedgerEntryWrapper const& account,
+                        int32_t neededWeight) const;
 
-    bool commonValidPreSeqNum(AbstractLedgerTxn& ltx);
+    bool commonValidPreSeqNum(LedgerSnapshot const& ls,
+                              MutableTransactionResultBase& txResult) const;
 
     enum ValidationType
     {
@@ -38,13 +43,10 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
     };
 
     ValidationType commonValid(SignatureChecker& signatureChecker,
-                               AbstractLedgerTxn& ltxOuter, bool applying);
+                               LedgerSnapshot const& ls, bool applying,
+                               MutableTransactionResultBase& txResult) const;
 
     void removeOneTimeSignerKeyFromFeeSource(AbstractLedgerTxn& ltx) const;
-
-  protected:
-    void resetResults(LedgerHeader const& header,
-                      std::optional<int64_t> baseFee, bool applying);
 
   public:
     FeeBumpTransactionFrame(Hash const& networkID,
@@ -53,20 +55,51 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
     FeeBumpTransactionFrame(Hash const& networkID,
                             TransactionEnvelope const& envelope,
                             TransactionFramePtr innerTx);
+
+    TransactionEnvelope& getMutableEnvelope() const override;
+    void clearCached() const override;
+
+    bool
+    isTestTx() const override
+    {
+        return false;
+    }
 #endif
 
     virtual ~FeeBumpTransactionFrame(){};
 
-    bool apply(Application& app, AbstractLedgerTxn& ltx,
-               TransactionMetaFrame& meta) override;
+    bool apply(AppConnector& app, AbstractLedgerTxn& ltx,
+               TransactionMetaFrame& meta, MutableTxResultPtr txResult,
+               Hash const& sorobanBasePrngSeed) const override;
 
-    bool checkValid(AbstractLedgerTxn& ltxOuter, SequenceNumber current,
-                    uint64_t lowerBoundCloseTimeOffset,
-                    uint64_t upperBoundCloseTimeOffset) override;
+    void processPostApply(AppConnector& app, AbstractLedgerTxn& ltx,
+                          TransactionMetaFrame& meta,
+                          MutableTxResultPtr txResult) const override;
+
+    MutableTxResultPtr
+    checkValid(AppConnector& app, LedgerSnapshot const& ls,
+               SequenceNumber current, uint64_t lowerBoundCloseTimeOffset,
+               uint64_t upperBoundCloseTimeOffset) const override;
+    bool checkSorobanResourceAndSetError(
+        AppConnector& app, SorobanNetworkConfig const& cfg,
+        uint32_t ledgerVersion, MutableTxResultPtr txResult) const override;
+
+    MutableTxResultPtr createSuccessResult() const override;
+
+    MutableTxResultPtr
+    createSuccessResultWithFeeCharged(LedgerHeader const& header,
+                                      std::optional<int64_t> baseFee,
+                                      bool applying) const override;
+
+    MutableTxResultPtr
+    createSuccessResultWithNewInnerTx(MutableTxResultPtr&& outerResult,
+                                      MutableTxResultPtr&& innerResult,
+                                      TransactionFrameBasePtr innerTx) const;
 
     TransactionEnvelope const& getEnvelope() const override;
 
-    int64_t getFeeBid() const override;
+    int64_t getFullFee() const override;
+    int64_t getInclusionFee() const override;
     int64_t getFee(LedgerHeader const& header, std::optional<int64_t> baseFee,
                    bool applying) const override;
 
@@ -75,10 +108,9 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
     Hash const& getInnerFullHash() const;
 
     uint32_t getNumOperations() const override;
-    std::vector<Operation> const& getRawOperations() const override;
+    Resource getResources(bool useByteLimitInClassic) const override;
 
-    TransactionResult& getResult() override;
-    TransactionResultCode getResultCode() const override;
+    std::vector<Operation> const& getRawOperations() const override;
 
     SequenceNumber getSeqNum() const override;
     AccountID getFeeSourceID() const override;
@@ -89,12 +121,14 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
 
     void
     insertKeysForFeeProcessing(UnorderedSet<LedgerKey>& keys) const override;
-    void insertKeysForTxApply(UnorderedSet<LedgerKey>& keys) const override;
+    void insertKeysForTxApply(UnorderedSet<LedgerKey>& keys,
+                              LedgerKeyMeter* lkMeter) const override;
 
-    void processFeeSeqNum(AbstractLedgerTxn& ltx,
-                          std::optional<int64_t> baseFee) override;
+    MutableTxResultPtr
+    processFeeSeqNum(AbstractLedgerTxn& ltx,
+                     std::optional<int64_t> baseFee) const override;
 
-    StellarMessage toStellarMessage() const override;
+    std::shared_ptr<StellarMessage const> toStellarMessage() const override;
 
     static TransactionEnvelope
     convertInnerTxToV1(TransactionEnvelope const& envelope);
@@ -102,8 +136,8 @@ class FeeBumpTransactionFrame : public TransactionFrameBase
     bool hasDexOperations() const override;
 
     bool isSoroban() const override;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-    SorobanResources sorobanResources() const override;
-#endif
+    SorobanResources const& sorobanResources() const override;
+    virtual int64 declaredSorobanResourceFee() const override;
+    virtual bool XDRProvidesValidFee() const override;
 };
 }

@@ -6,6 +6,7 @@
 
 #include "invariant/Invariant.h"
 #include "ledger/InternalLedgerEntry.h"
+#include "transactions/TransactionUtils.h"
 #include "xdr/Stellar-ledger-entries.h"
 #include <memory>
 
@@ -21,8 +22,7 @@ struct LedgerTxnDelta;
 class LedgerEntryIsValid : public Invariant
 {
   public:
-    LedgerEntryIsValid();
-
+    LedgerEntryIsValid(LumenContractInfo const& lumenContractInfo);
     static std::shared_ptr<Invariant> registerInvariant(Application& app);
 
     virtual std::string getName() const override;
@@ -48,14 +48,17 @@ class LedgerEntryIsValid : public Invariant
                              LedgerEntry const* previous, uint32 version) const;
     std::string checkIsValid(LiquidityPoolEntry const& lp,
                              LedgerEntry const* previous, uint32 version) const;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     std::string checkIsValid(ContractDataEntry const& cde,
                              LedgerEntry const* previous, uint32 version) const;
     std::string checkIsValid(ContractCodeEntry const& cce,
                              LedgerEntry const* previous, uint32 version) const;
     std::string checkIsValid(ConfigSettingEntry const& ce,
                              LedgerEntry const* previous, uint32 version) const;
-#endif
+    std::string checkIsValid(TTLEntry const& te, LedgerEntry const* previous,
+                             uint32 version) const;
+
     bool validatePredicate(ClaimPredicate const& pred, uint32_t depth) const;
+
+    LumenContractInfo const mLumenContractInfo;
 };
 }

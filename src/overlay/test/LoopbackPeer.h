@@ -57,8 +57,7 @@ class LoopbackPeer : public Peer
     AuthCert getAuthCert() override;
 
     void processInQueue();
-
-    std::string mDropReason;
+    void recvMessage(xdr::msg_ptr const& xdrBytes);
 
   public:
     virtual ~LoopbackPeer()
@@ -66,12 +65,13 @@ class LoopbackPeer : public Peer
     }
     LoopbackPeer(Application& app, PeerRole role);
 
+    void recvMessage(std::shared_ptr<CapacityTrackedMessage> msgTracker);
+
     static std::pair<std::shared_ptr<LoopbackPeer>,
                      std::shared_ptr<LoopbackPeer>>
     initiate(Application& app, Application& otherApp);
 
-    void drop(std::string const& reason, DropDirection dropDirection,
-              DropMode dropMode) override;
+    void drop(std::string const& reason, DropDirection dropDirection) override;
 
     void deliverOne();
     void deliverAll();
@@ -110,15 +110,19 @@ class LoopbackPeer : public Peer
     double getReorderProbability() const;
     void setReorderProbability(double d);
 
-#ifdef BUILD_TESTS
-    void
-    overrideDisablePullModeForTesting()
-    {
-        mOverrideDisablePullModeForTesting = true;
-    }
-#endif
-
     void clearInAndOutQueues();
+
+    virtual bool
+    useBackgroundThread() const override
+    {
+        return false;
+    }
+
+    size_t
+    getTxQueueByteCount() const
+    {
+        return mFlowControl->getTxQueueByteCountForTesting();
+    }
 
     std::string
     getDropReason() const
@@ -135,18 +139,24 @@ class LoopbackPeer : public Peer
     uint64_t
     getOutboundCapacity()
     {
-        return getFlowControl()
-            ->getFlowControlCapacity()
-            ->getOutboundCapacity();
+        return getFlowControl()->getCapacity().getOutboundCapacity();
     }
 
-    bool checkCapacity(uint64_t expectedOutboundCapacity) const;
+    Config const&
+    getConfig()
+    {
+        return mAppConnector.getConfig();
+    }
 
-    std::string getIP() const override;
+    bool checkCapacity(std::shared_ptr<LoopbackPeer> otherPeer) const;
 
+    std::string getIP() const;
+
+    using Peer::recvMessage;
     using Peer::sendAuth;
     using Peer::sendAuthenticatedMessage;
     using Peer::sendMessage;
+    using Peer::sendPeers;
 
     friend class LoopbackPeerConnection;
 };

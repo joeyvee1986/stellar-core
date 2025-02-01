@@ -13,6 +13,7 @@
 #include "util/Logging.h"
 #include "util/Math.h"
 #include "xdrpp/marshal.h"
+#include <Tracy.hpp>
 
 namespace stellar
 {
@@ -25,6 +26,8 @@ using namespace std;
 
 LoopbackPeer::LoopbackPeer(Application& app, PeerRole role) : Peer(app, role)
 {
+    mFlowControl =
+        std::make_shared<FlowControl>(mAppConnector, useBackgroundThread());
 }
 
 std::string
@@ -46,13 +49,13 @@ LoopbackPeer::initiate(Application& app, Application& otherApp)
     otherPeer->mRemote = peer;
     otherPeer->mState = Peer::CONNECTED;
 
-    peer->mAddress = PeerBareAddress(otherPeer->getIP(),
-                                     otherPeer->getApp().getConfig().PEER_PORT);
+    peer->mAddress =
+        PeerBareAddress(otherPeer->getIP(), otherPeer->getConfig().PEER_PORT);
     otherPeer->mAddress =
-        PeerBareAddress{peer->getIP(), peer->getApp().getConfig().PEER_PORT};
+        PeerBareAddress{peer->getIP(), peer->getConfig().PEER_PORT};
 
     app.getOverlayManager().addOutboundConnection(peer);
-    otherApp.getOverlayManager().addInboundConnection(otherPeer);
+    otherApp.getOverlayManager().maybeAddInboundConnection(otherPeer);
     // if connection was dropped during addPendingPeer, we don't want do call
     // connectHandler
     if (peer->mState != Peer::CONNECTED || otherPeer->mState != Peer::CONNECTED)
@@ -64,7 +67,7 @@ LoopbackPeer::initiate(Application& app, Application& otherApp)
     otherPeer->startRecurrentTimer();
 
     std::weak_ptr<LoopbackPeer> init = peer;
-    peer->getApp().postOnMainThread(
+    peer->mAppConnector.postOnMainThread(
         [init]() {
             auto inC = init.lock();
             if (inC)
@@ -98,21 +101,19 @@ LoopbackPeer::sendMessage(xdr::msg_ptr&& msg)
 {
     if (mRemote.expired())
     {
-        drop("remote expired", Peer::DropDirection::WE_DROPPED_REMOTE,
-             Peer::DropMode::IGNORE_WRITE_QUEUE);
+        drop("remote expired", Peer::DropDirection::WE_DROPPED_REMOTE);
         return;
     }
 
     // Damage authentication material.
     if (mDamageAuth)
     {
-        auto bytes = randomBytes(mRecvMacKey.key.size());
-        std::copy(bytes.begin(), bytes.end(), mRecvMacKey.key.begin());
+        mHmac.damageRecvMacKey();
     }
 
     TimestampedMessage tsm;
     tsm.mMessage = std::move(msg);
-    tsm.mEnqueuedTime = mApp.getClock().now();
+    tsm.mEnqueuedTime = mAppConnector.now();
     mOutQueue.emplace_back(std::move(tsm));
     // Possibly flush some queued messages if queue's full.
     while (mOutQueue.size() > mMaxQueueDepth && !mCorked)
@@ -144,7 +145,7 @@ LoopbackPeer::sendMessage(xdr::msg_ptr&& msg)
 }
 
 void
-LoopbackPeer::drop(std::string const& reason, DropDirection direction, DropMode)
+LoopbackPeer::drop(std::string const& reason, DropDirection direction)
 {
     if (mState == CLOSING)
     {
@@ -154,7 +155,7 @@ LoopbackPeer::drop(std::string const& reason, DropDirection direction, DropMode)
     if (mState != GOT_AUTH)
     {
         CLOG_DEBUG(Overlay, "LoopbackPeer::drop {} in state {} we called:{}",
-                   toString(), mState, mRole);
+                   toString(), format_as(mState), format_as(mRole));
     }
     else if (direction == Peer::DropDirection::WE_DROPPED_REMOTE)
     {
@@ -168,13 +169,13 @@ LoopbackPeer::drop(std::string const& reason, DropDirection direction, DropMode)
 
     mDropReason = reason;
     mState = CLOSING;
-    Peer::shutdown();
-    getApp().getOverlayManager().removePeer(this);
+    cancelTimers();
+    mAppConnector.getOverlayManager().removePeer(this);
 
     auto remote = mRemote.lock();
     if (remote)
     {
-        remote->getApp().postOnMainThread(
+        remote->mAppConnector.postOnMainThread(
             [remW = mRemote, reason, direction]() {
                 auto remS = remW.lock();
                 if (remS)
@@ -183,8 +184,7 @@ LoopbackPeer::drop(std::string const& reason, DropDirection direction, DropMode)
                                direction ==
                                        Peer::DropDirection::WE_DROPPED_REMOTE
                                    ? Peer::DropDirection::REMOTE_DROPPED_US
-                                   : Peer::DropDirection::WE_DROPPED_REMOTE,
-                               Peer::DropMode::IGNORE_WRITE_QUEUE);
+                                   : Peer::DropDirection::WE_DROPPED_REMOTE);
                 }
             },
             "LoopbackPeer: drop");
@@ -228,9 +228,8 @@ duplicateMessage(Peer::TimestampedMessage const& msg)
 void
 LoopbackPeer::processInQueue()
 {
-    if (!canRead())
+    if (mFlowControl->maybeThrottleRead())
     {
-        mIsPeerThrottled = true;
         return;
     }
 
@@ -244,10 +243,48 @@ LoopbackPeer::processInQueue()
         if (!mInQueue.empty())
         {
             auto self = static_pointer_cast<LoopbackPeer>(shared_from_this());
-            mApp.postOnMainThread([self]() { self->processInQueue(); },
-                                  "LoopbackPeer: processInQueue");
+            mAppConnector.postOnMainThread([self]() { self->processInQueue(); },
+                                           "LoopbackPeer: processInQueue");
         }
     }
+}
+
+void
+LoopbackPeer::recvMessage(xdr::msg_ptr const& msg)
+{
+    ZoneScoped;
+    if (shouldAbortForTesting())
+    {
+        return;
+    }
+
+    try
+    {
+        ZoneNamedN(hmacZone, "message HMAC", true);
+        AuthenticatedMessage am;
+        {
+            ZoneNamedN(xdrZone, "XDR deserialize", true);
+            xdr::xdr_from_msg(msg, am);
+        }
+        recvAuthenticatedMessage(std::move(am));
+    }
+    catch (xdr::xdr_runtime_error& e)
+    {
+        CLOG_ERROR(Overlay, "received corrupt xdr::msg_ptr {}", e.what());
+        drop("received corrupted message",
+             Peer::DropDirection::WE_DROPPED_REMOTE);
+        return;
+    }
+}
+
+void
+LoopbackPeer::recvMessage(std::shared_ptr<CapacityTrackedMessage> msgTracker)
+{
+    mAppConnector.postOnMainThread(
+        [self = shared_from_this(), msgTracker]() {
+            self->recvMessage(msgTracker);
+        },
+        "LoopbackPeer: processInQueue");
 }
 
 void
@@ -309,7 +346,7 @@ LoopbackPeer::deliverOne()
         {
             // move msg to remote's in queue
             remote->mInQueue.emplace(std::move(msg.mMessage));
-            remote->getApp().postOnMainThread(
+            remote->mAppConnector.postOnMainThread(
                 [remW = mRemote]() {
                     auto remS = remW.lock();
                     if (remS)
@@ -319,9 +356,9 @@ LoopbackPeer::deliverOne()
                 },
                 "LoopbackPeer: processInQueue in deliverOne");
         }
-        mLastWrite = mApp.getClock().now();
-        getOverlayMetrics().mMessageWrite.Mark();
-        getOverlayMetrics().mByteWrite.Mark(nBytes);
+        mLastWrite = mAppConnector.now();
+        mOverlayMetrics.mMessageWrite.Mark();
+        mOverlayMetrics.mByteWrite.Mark(nBytes);
         ++mPeerMetrics.mMessageWrite;
         mPeerMetrics.mByteWrite += nBytes;
     }
@@ -506,8 +543,7 @@ LoopbackPeerConnection::~LoopbackPeerConnection()
     // NB: Dropping the peer from one side will automatically drop the
     // other.
     mInitiator->drop("loopback destruction",
-                     Peer::DropDirection::WE_DROPPED_REMOTE,
-                     Peer::DropMode::IGNORE_WRITE_QUEUE);
+                     Peer::DropDirection::WE_DROPPED_REMOTE);
 }
 
 std::shared_ptr<LoopbackPeer>
@@ -523,9 +559,13 @@ LoopbackPeerConnection::getAcceptor() const
 }
 
 bool
-LoopbackPeer::checkCapacity(uint64_t expectedOutboundCapacity) const
+LoopbackPeer::checkCapacity(std::shared_ptr<LoopbackPeer> otherPeer) const
 {
-    return expectedOutboundCapacity ==
-           getFlowControl()->getFlowControlCapacity()->getOutboundCapacity();
+    // Outbound capacity is equal to the config on the other node
+    return otherPeer->getConfig().PEER_FLOOD_READING_CAPACITY ==
+               getFlowControl()->getCapacity().getOutboundCapacity() &&
+           otherPeer->mAppConnector.getOverlayManager()
+                   .getFlowControlBytesTotal() ==
+               getFlowControl()->getCapacityBytes().getOutboundCapacity();
 }
 }

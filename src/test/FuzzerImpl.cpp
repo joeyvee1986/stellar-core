@@ -16,6 +16,7 @@
 #include "test/TxTests.h"
 #include "test/fuzz.h"
 #include "test/test.h"
+#include "transactions/MutableTransactionResult.h"
 #include "transactions/OperationFrame.h"
 #include "transactions/SignatureChecker.h"
 #include "transactions/TransactionMetaFrame.h"
@@ -160,14 +161,20 @@ getShortKey(LedgerKey const& key)
         return getShortKey(key.claimableBalance().balanceID);
     case LIQUIDITY_POOL:
         return getShortKey(key.liquidityPool().liquidityPoolID);
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case CONFIG_SETTING:
         return static_cast<uint8_t>(key.configSetting().configSettingID);
     case CONTRACT_DATA:
-        return key.contractData().contractID.at(0);
+        switch (key.contractData().contract.type())
+        {
+        case SC_ADDRESS_TYPE_ACCOUNT:
+            return getShortKey(key.contractData().contract.accountId());
+        case SC_ADDRESS_TYPE_CONTRACT:
+            return key.contractData().contract.contractId().at(0);
+        }
     case CONTRACT_CODE:
         return key.contractCode().hash.at(0);
-#endif
+    case TTL:
+        return getShortKey(key.ttl().keyHash);
     }
     throw std::runtime_error("Unknown key type");
 }
@@ -804,6 +811,46 @@ generator_t::operator()(stellar::PublicKey& t) const
         t.ed25519(), static_cast<uint8_t>(stellar::rand_uniform<int>(
                          0, NUMBER_OF_ACCOUNT_IDS_TO_GENERATE - 1)));
 }
+
+static int RECURSION_COUNT = 0;
+static const int RECURSION_LIMIT = 50;
+
+template <>
+void
+generator_t::operator()<stellar::SCVal>(stellar::SCVal& val) const
+{
+    if (++RECURSION_COUNT > RECURSION_LIMIT)
+    {
+        stellar::SCVal v;
+        val = v;
+        return;
+    }
+    const auto& vals = stellar::SCVal::_xdr_case_values();
+    stellar::SCValType v;
+
+    uint32_t n = 0;
+    (*this)(n);
+    v = vals[n % vals.size()];
+
+    val._xdr_discriminant(v, false);
+    val._xdr_with_mem_ptr(field_archiver, v, *this, val, nullptr);
+}
+
+template <>
+void
+generator_t::operator()<stellar::SorobanAuthorizedInvocation>(
+    stellar::SorobanAuthorizedInvocation& auth) const
+{
+    if (++RECURSION_COUNT > RECURSION_LIMIT)
+    {
+        stellar::SorobanAuthorizedInvocation a;
+        auth = a;
+        return;
+    }
+
+    xdr_traits<stellar::SorobanAuthorizedInvocation>::load(*this, auth);
+}
+
 #endif // FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
 }
 
@@ -821,7 +868,7 @@ getFuzzConfig(int instanceNumber)
     cfg.ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = false;
     cfg.ARTIFICIALLY_SET_CLOSE_TIME_FOR_TESTING = UINT32_MAX;
     cfg.HTTP_PORT = 0;
-    cfg.WORKER_THREADS = 1;
+    cfg.WORKER_THREADS = 2;
     cfg.QUORUM_INTERSECTION_CHECKER = false;
     cfg.PREFERRED_PEERS_ONLY = false;
     cfg.RUN_STANDALONE = true;
@@ -840,7 +887,8 @@ resetTxInternalState(Application& app)
     app.getLedgerTxnRoot().resetForFuzzer();
     app.getInvariantManager().resetForFuzzer();
 #endif // BUILD_TESTS
-    app.getDatabase().clearPreparedStatementCache();
+    app.getDatabase().clearPreparedStatementCache(
+        app.getDatabase().getSession());
 }
 
 // FuzzTransactionFrame is a specialized TransactionFrame that includes
@@ -848,43 +896,79 @@ resetTxInternalState(Application& app)
 // ledger state and deterministically attempting application of transactions.
 class FuzzTransactionFrame : public TransactionFrame
 {
+  private:
+    MutableTxResultPtr mTxResult;
+
   public:
     FuzzTransactionFrame(Hash const& networkID,
                          TransactionEnvelope const& envelope)
-        : TransactionFrame(networkID, envelope){};
+        : TransactionFrame(networkID, envelope)
+        , mTxResult(createSuccessResult()){};
 
     void
     attemptApplication(Application& app, AbstractLedgerTxn& ltx)
     {
+        // No soroban ops allowed
+        if (std::any_of(getOperations().begin(), getOperations().end(),
+                        [](auto const& x) { return x->isSoroban(); }))
+        {
+            mTxResult->setResultCode(txFAILED);
+            return;
+        }
+
         // reset results of operations
-        resetResults(ltx.getHeader(), 0, true);
+        mTxResult = createSuccessResultWithFeeCharged(ltx.getHeader(), 0, true);
 
         // attempt application of transaction without processing the fee or
         // committing the LedgerTxn
         SignatureChecker signatureChecker{
             ltx.loadHeader().current().ledgerVersion, getContentsHash(),
             mEnvelope.v1().signatures};
+        LedgerSnapshot ltxStmt(ltx);
         // if any ill-formed Operations, do not attempt transaction application
-        auto isInvalidOperation = [&](auto const& op) {
-            return !op->checkValid(signatureChecker, ltx, false);
+        auto isInvalidOperation = [&](auto const& op, auto& opResult) {
+            return !op->checkValid(
+                app.getAppConnector(), signatureChecker,
+                app.getAppConnector().getSorobanNetworkConfigReadOnly(),
+                ltxStmt, false, opResult, mTxResult->getSorobanData());
         };
-        if (std::any_of(mOperations.begin(), mOperations.end(),
-                        isInvalidOperation))
+
+        auto const& ops = getOperations();
+        for (size_t i = 0; i < ops.size(); ++i)
         {
-            markResultFailed();
-            return;
+            auto const& op = ops[i];
+            auto& opResult = mTxResult->getOpResultAt(i);
+            if (isInvalidOperation(op, opResult))
+            {
+                mTxResult->setResultCode(txFAILED);
+                return;
+            }
         }
+
         // while the following method's result is not captured, regardless, for
         // protocols < 8, this triggered buggy caching, and potentially may do
         // so in the future
         loadSourceAccount(ltx, ltx.loadHeader());
         processSeqNum(ltx);
         TransactionMetaFrame tm(2);
-        applyOperations(signatureChecker, app, ltx, tm);
-        if (getResultCode() == txINTERNAL_ERROR)
+        applyOperations(signatureChecker, app.getAppConnector(), ltx, tm,
+                        *mTxResult, Hash{});
+        if (mTxResult->getResultCode() == txINTERNAL_ERROR)
         {
             throw std::runtime_error("Internal error while fuzzing");
         }
+    }
+
+    TransactionResult&
+    getResult()
+    {
+        return mTxResult->getResult();
+    }
+
+    TransactionResultCode
+    getResultCode() const
+    {
+        return mTxResult->getResultCode();
     }
 };
 
@@ -946,19 +1030,24 @@ applySetupOperations(LedgerTxn& ltx, PublicKey const& sourceAccount,
 
         if (txFramePtr->getResultCode() != txSUCCESS)
         {
-            auto const msg = fmt::format(
-                FMT_STRING("Error {} while setting up fuzzing -- "
-                           "{}"),
-                txFramePtr->getResultCode(),
-                xdr_to_string(txFramePtr->getResult(), "TransactionResult"));
+            auto const msg =
+                fmt::format(FMT_STRING("Error {} while setting up fuzzing -- "
+                                       "{}"),
+                            txFramePtr->getResultCode(),
+                            xdrToCerealString(txFramePtr->getResult(),
+                                              "TransactionResult"));
             LOG_FATAL(DEFAULT_LOG, "{}", msg);
             throw std::runtime_error(msg);
         }
 
-        for (auto const& opFrame : txFramePtr->getOperations())
+        auto const& ops = txFramePtr->getOperations();
+        for (size_t i = 0; i < ops.size(); ++i)
         {
+            auto const& opFrame = ops.at(i);
+            auto& opResult = txFramePtr->getResult().result.results().at(i);
+
             auto const& op = opFrame->getOperation();
-            auto const& tr = opFrame->getResult().tr();
+            auto const& tr = opResult.tr();
             auto const opType = op.body.type();
 
             if ((opType == MANAGE_BUY_OFFER &&
@@ -974,8 +1063,8 @@ applySetupOperations(LedgerTxn& ltx, PublicKey const& sourceAccount,
                 auto const msg = fmt::format(
                     FMT_STRING("Manage offer result {} while setting "
                                "up fuzzing -- {}"),
-                    xdr_to_string(tr, "Operation"),
-                    xdr_to_string(op, "Operation"));
+                    xdrToCerealString(tr, "Operation"),
+                    xdrToCerealString(op, "Operation"));
                 LOG_FATAL(DEFAULT_LOG, "{}", msg);
                 throw std::runtime_error(msg);
             }
@@ -1915,7 +2004,7 @@ TransactionFuzzer::inject(std::string const& filename)
 
     resetTxInternalState(*mApp);
     LOG_TRACE(DEFAULT_LOG, "{}",
-              xdr_to_string(ops, fmt::format("Fuzz ops ({})", ops.size())));
+              xdrToCerealString(ops, fmt::format("Fuzz ops ({})", ops.size())));
 
     LedgerTxn ltx(mApp->getLedgerTxnRoot());
     applyFuzzOperations(ltx, mSourceAccountID, ops.begin(), ops.end(), *mApp);
@@ -1943,6 +2032,15 @@ TransactionFuzzer::genFuzz(std::string const& filename)
     for (int i = 0; i < numops; ++i)
     {
         Operation op = gen(FUZZER_INITIAL_CORPUS_OPERATION_GEN_UPPERBOUND);
+        if (op.body.type() == INVOKE_HOST_FUNCTION ||
+            op.body.type() == EXTEND_FOOTPRINT_TTL ||
+            op.body.type() == RESTORE_FOOTPRINT)
+        {
+            // Skip soroban txs for now because setting them up to be valid will
+            // take some time.
+            continue;
+        }
+
         // Use account 0 for the base cases as it's more likely to be useful
         // right away.
         if (!op.sourceAccount)
@@ -2047,12 +2145,14 @@ OverlayFuzzer::inject(std::string const& filename)
     auto initiator = loopbackPeerConnection->getInitiator();
     auto acceptor = loopbackPeerConnection->getAcceptor();
 
-    initiator->getApp().getClock().postAction(
-        [initiator, msg]() {
-            initiator->Peer::sendMessage(
-                std::make_shared<StellarMessage const>(msg));
-        },
-        "main", Scheduler::ActionType::NORMAL_ACTION);
+    mSimulation->getNode(initiator->getPeerID())
+        ->getClock()
+        .postAction(
+            [initiator, msg]() {
+                initiator->Peer::sendMessage(
+                    std::make_shared<StellarMessage const>(msg));
+            },
+            "main", Scheduler::ActionType::NORMAL_ACTION);
 
     mSimulation->crankForAtMost(std::chrono::milliseconds{500}, false);
 
@@ -2060,9 +2160,13 @@ OverlayFuzzer::inject(std::string const& filename)
     initiator->clearInAndOutQueues();
     acceptor->clearInAndOutQueues();
 
-    while (initiator->getApp().getClock().cancelAllEvents())
+    while (mSimulation->getNode(initiator->getPeerID())
+               ->getClock()
+               .cancelAllEvents())
         ;
-    while (acceptor->getApp().getClock().cancelAllEvents())
+    while (mSimulation->getNode(acceptor->getPeerID())
+               ->getClock()
+               .cancelAllEvents())
         ;
 }
 

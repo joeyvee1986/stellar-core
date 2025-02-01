@@ -20,12 +20,10 @@ TransactionMetaFrame::TransactionMetaFrame(uint32_t protocolVersion)
     // have no obligation to consume it under any circumstance -- so this
     // class just switches between cases 2 and 3.
     mVersion = 2;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     if (protocolVersionStartsFrom(protocolVersion, SOROBAN_PROTOCOL_VERSION))
     {
         mVersion = 3;
     }
-#endif
     mTransactionMeta.v(mVersion);
 }
 
@@ -43,10 +41,8 @@ TransactionMetaFrame::getNumChangesBefore() const
     {
     case 2:
         return mTransactionMeta.v2().txChangesBefore.size();
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case 3:
         return mTransactionMeta.v3().txChangesBefore.size();
-#endif
     default:
         releaseAssert(false);
     }
@@ -59,10 +55,22 @@ TransactionMetaFrame::getChangesBefore() const
     {
     case 2:
         return mTransactionMeta.v2().txChangesBefore;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case 3:
         return mTransactionMeta.v3().txChangesBefore;
-#endif
+    default:
+        releaseAssert(false);
+    }
+}
+
+LedgerEntryChanges
+TransactionMetaFrame::getChangesAfter() const
+{
+    switch (mTransactionMeta.v())
+    {
+    case 2:
+        return mTransactionMeta.v2().txChangesAfter;
+    case 3:
+        return mTransactionMeta.v3().txChangesAfter;
     default:
         releaseAssert(false);
     }
@@ -71,17 +79,14 @@ TransactionMetaFrame::getChangesBefore() const
 void
 TransactionMetaFrame::pushTxChangesBefore(LedgerEntryChanges&& changes)
 {
-    releaseAssert(!mHashesFinalized);
     switch (mTransactionMeta.v())
     {
     case 2:
         vecAppend(mTransactionMeta.v2().txChangesBefore, std::move(changes));
         break;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case 3:
         vecAppend(mTransactionMeta.v3().txChangesBefore, std::move(changes));
         break;
-#endif
     default:
         releaseAssert(false);
     }
@@ -90,17 +95,14 @@ TransactionMetaFrame::pushTxChangesBefore(LedgerEntryChanges&& changes)
 void
 TransactionMetaFrame::clearOperationMetas()
 {
-    releaseAssert(!mHashesFinalized);
     switch (mTransactionMeta.v())
     {
     case 2:
         mTransactionMeta.v2().operations.clear();
         break;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case 3:
         mTransactionMeta.v3().operations.clear();
         break;
-#endif
     default:
         releaseAssert(false);
     }
@@ -109,17 +111,14 @@ TransactionMetaFrame::clearOperationMetas()
 void
 TransactionMetaFrame::pushOperationMetas(xdr::xvector<OperationMeta>&& opMetas)
 {
-    releaseAssert(!mHashesFinalized);
     switch (mTransactionMeta.v())
     {
     case 2:
         vecAppend(mTransactionMeta.v2().operations, std::move(opMetas));
         break;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case 3:
         vecAppend(mTransactionMeta.v3().operations, std::move(opMetas));
         break;
-#endif
     default:
         releaseAssert(false);
     }
@@ -132,10 +131,8 @@ TransactionMetaFrame::getNumOperations() const
     {
     case 2:
         return mTransactionMeta.v2().operations.size();
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case 3:
         return mTransactionMeta.v3().operations.size();
-#endif
     default:
         releaseAssert(false);
     }
@@ -144,17 +141,14 @@ TransactionMetaFrame::getNumOperations() const
 void
 TransactionMetaFrame::pushTxChangesAfter(LedgerEntryChanges&& changes)
 {
-    releaseAssert(!mHashesFinalized);
     switch (mTransactionMeta.v())
     {
     case 2:
         vecAppend(mTransactionMeta.v2().txChangesAfter, std::move(changes));
         break;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case 3:
         vecAppend(mTransactionMeta.v3().txChangesAfter, std::move(changes));
         break;
-#endif
     default:
         releaseAssert(false);
     }
@@ -163,100 +157,29 @@ TransactionMetaFrame::pushTxChangesAfter(LedgerEntryChanges&& changes)
 void
 TransactionMetaFrame::clearTxChangesAfter()
 {
-    releaseAssert(!mHashesFinalized);
     switch (mTransactionMeta.v())
     {
     case 2:
         mTransactionMeta.v2().txChangesAfter.clear();
         break;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case 3:
         mTransactionMeta.v3().txChangesAfter.clear();
         break;
-#endif
     default:
         releaseAssert(false);
     }
 }
 
 void
-TransactionMetaFrame::setTxResult(TransactionResult const& res)
+TransactionMetaFrame::pushContractEvents(xdr::xvector<ContractEvent>&& events)
 {
-    releaseAssert(!mHashesFinalized);
-    switch (mTransactionMeta.v())
-    {
-    case 2:
-        // Do nothing, until v3 we emit the txresult elsewhere.
-        break;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-    case 3:
-        mTransactionMeta.v3().txResult = res;
-        break;
-#endif
-    default:
-        releaseAssert(false);
-    }
-}
-
-void
-TransactionMetaFrame::finalizeHashes()
-{
-    releaseAssert(!mHashesFinalized);
-    switch (mTransactionMeta.v())
-    {
-    case 2:
-        // Do nothing, until v3 we have no hashes.
-        break;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-    case 3:
-    {
-        // Calculate 3 hashes as described in CAP-0056:
-        //
-        //  hash[0] = sha256(txChangesBefore, operations, txChangesAfter)
-        //  hash[1] = sha256(events)
-        //  hash[2] = sha256(txResult)
-        //
-        // These will, in turn, be combined into a single hash in
-        // getHashOfMetaHashes below, which fills in the
-        // TransactionResultPairV2.hashOfMetaHashes value in various contexts.
-
-        normalizeMeta(mTransactionMeta);
-
-        SHA256 sha;
-
-        sha.add(xdr::xdr_to_opaque(mTransactionMeta.v3().txChangesBefore));
-        sha.add(xdr::xdr_to_opaque(mTransactionMeta.v3().operations));
-        sha.add(xdr::xdr_to_opaque(mTransactionMeta.v3().txChangesAfter));
-        mTransactionMeta.v3().hashes[0] = sha.finish();
-
-        sha.reset();
-        sha.add(xdr::xdr_to_opaque(mTransactionMeta.v3().events));
-        mTransactionMeta.v3().hashes[1] = sha.finish();
-
-        sha.reset();
-        sha.add(xdr::xdr_to_opaque(mTransactionMeta.v3().txResult));
-        mTransactionMeta.v3().hashes[2] = sha.finish();
-    }
-    break;
-#endif
-    default:
-        releaseAssert(false);
-    }
-    mHashesFinalized = true;
-}
-
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-void
-TransactionMetaFrame::pushContractEvents(xdr::xvector<OperationEvents>&& events)
-{
-    releaseAssert(!mHashesFinalized);
     switch (mTransactionMeta.v())
     {
     case 2:
         // Do nothing, until v3 we don't create events.
         break;
     case 3:
-        mTransactionMeta.v3().events = std::move(events);
+        mTransactionMeta.v3().sorobanMeta.activate().events = std::move(events);
         break;
     default:
         releaseAssert(false);
@@ -265,7 +188,7 @@ TransactionMetaFrame::pushContractEvents(xdr::xvector<OperationEvents>&& events)
 
 void
 TransactionMetaFrame::pushDiagnosticEvents(
-    xdr::xvector<OperationDiagnosticEvents>&& events)
+    xdr::xvector<DiagnosticEvent>&& events)
 {
     switch (mTransactionMeta.v())
     {
@@ -273,31 +196,59 @@ TransactionMetaFrame::pushDiagnosticEvents(
         // Do nothing, until v3 we don't create events.
         break;
     case 3:
-        mTransactionMeta.v3().diagnosticEvents = std::move(events);
+        mTransactionMeta.v3().sorobanMeta.activate().diagnosticEvents =
+            std::move(events);
         break;
     default:
         releaseAssert(false);
     }
 }
 
-Hash
-TransactionMetaFrame::getHashOfMetaHashes(TransactionMeta const& tm)
+void
+TransactionMetaFrame::setReturnValue(SCVal&& returnValue)
 {
-    // We should only ever be calling this on a v3 txmeta.
-    releaseAssert(tm.v() == 3);
-    SHA256 sha;
-    for (auto h : tm.v3().hashes)
+    switch (mTransactionMeta.v())
     {
-        sha.add(h);
+    case 2:
+        // Do nothing, until v3 we don't call into contracts.
+        break;
+    case 3:
+        mTransactionMeta.v3().sorobanMeta.activate().returnValue =
+            std::move(returnValue);
+        break;
+    default:
+        releaseAssert(false);
     }
-    return sha.finish();
 }
-#endif
+
+void
+TransactionMetaFrame::setSorobanFeeInfo(int64_t nonRefundableFeeSpent,
+                                        int64_t totalRefundableFeeSpent,
+                                        int64_t rentFeeCharged)
+{
+    switch (mTransactionMeta.v())
+    {
+    case 2:
+        // Do nothing, until v3 we don't call into contracts.
+        break;
+    case 3:
+    {
+        auto& sorobanMeta = mTransactionMeta.v3().sorobanMeta.activate();
+        sorobanMeta.ext.v(1);
+        auto& ext = sorobanMeta.ext.v1();
+        ext.totalNonRefundableResourceFeeCharged = nonRefundableFeeSpent;
+        ext.totalRefundableResourceFeeCharged = totalRefundableFeeSpent;
+        ext.rentFeeCharged = rentFeeCharged;
+        break;
+    }
+    default:
+        releaseAssert(false);
+    }
+}
 
 TransactionMeta const&
 TransactionMetaFrame::getXDR() const
 {
-    releaseAssert(mHashesFinalized);
     return mTransactionMeta;
 }
 }

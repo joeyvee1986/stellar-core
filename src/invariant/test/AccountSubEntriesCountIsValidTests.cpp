@@ -59,12 +59,10 @@ generateRandomSubEntry(LedgerEntry const& acc)
     {
         le = LedgerTestUtils::generateValidLedgerEntry(5);
     } while (le.data.type() == ACCOUNT || le.data.type() == CLAIMABLE_BALANCE ||
-             le.data.type() == LIQUIDITY_POOL
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-             || le.data.type() == CONFIG_SETTING ||
-             le.data.type() == CONTRACT_DATA || le.data.type() == CONTRACT_CODE
-#endif
-    );
+             le.data.type() == LIQUIDITY_POOL ||
+             le.data.type() == CONFIG_SETTING ||
+             le.data.type() == CONTRACT_DATA ||
+             le.data.type() == CONTRACT_CODE || le.data.type() == TTL);
     le.lastModifiedLedgerSeq = acc.lastModifiedLedgerSeq;
 
     switch (le.data.type())
@@ -95,11 +93,10 @@ generateRandomSubEntry(LedgerEntry const& acc)
     case CLAIMABLE_BALANCE:
     case ACCOUNT:
     case LIQUIDITY_POOL:
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case CONFIG_SETTING:
     case CONTRACT_DATA:
     case CONTRACT_CODE:
-#endif
+    case TTL:
     default:
         abort();
     }
@@ -120,11 +117,10 @@ generateRandomModifiedSubEntry(LedgerEntry const& acc, LedgerEntry const& se)
     case ACCOUNT:
     case CLAIMABLE_BALANCE:
     case LIQUIDITY_POOL:
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case CONFIG_SETTING:
     case CONTRACT_DATA:
     case CONTRACT_CODE:
-#endif
+    case TTL:
         break;
     case OFFER:
         res.data.offer().offerID = se.data.offer().offerID;
@@ -296,7 +292,7 @@ deleteRandomSubEntryFromAccount(Application& app, LedgerEntry& le,
 TEST_CASE("Create account with no subentries",
           "[invariant][accountsubentriescount]")
 {
-    Config cfg = getTestConfig(0);
+    Config cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
     cfg.INVARIANT_CHECKS = {"AccountSubEntriesCountIsValid"};
     VirtualClock clock;
     Application::pointer app = createTestApplication(clock, cfg);
@@ -313,7 +309,7 @@ TEST_CASE("Create account then add signers and subentries",
           "[invariant][accountsubentriescount]")
 {
     stellar::uniform_int_distribution<int32_t> changesDist(-1, 2);
-    Config cfg = getTestConfig(0);
+    Config cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
     cfg.INVARIANT_CHECKS = {"AccountSubEntriesCountIsValid"};
 
     for (uint32_t i = 0; i < 50; ++i)

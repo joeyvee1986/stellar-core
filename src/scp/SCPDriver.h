@@ -179,6 +179,12 @@ class SCPDriver
     // quorum can exchange 4 messages
     virtual std::chrono::milliseconds computeTimeout(uint32 roundNumber);
 
+    // returns the weight of the node within the qset normalized between
+    // 0-UINT64_MAX. If `nodeID` is the local node, then set `isLocalNode` to
+    // `true`.
+    virtual uint64 getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
+                                 bool isLocalNode) const;
+
     // Inform about events happening within the consensus algorithm.
 
     // `valueExternalized` is called at most once per slot when the slot
@@ -238,6 +244,15 @@ class SCPDriver
     ballotDidHearFromQuorum(uint64 slotIndex, SCPBallot const& ballot)
     {
     }
+
+#ifdef BUILD_TESTS
+    std::function<uint64(NodeID const&)> mPriorityLookupForTesting;
+    void
+    setPriorityLookup(std::function<uint64(NodeID const&)> const& f)
+    {
+        mPriorityLookupForTesting = f;
+    }
+#endif
 
   private:
     uint64

@@ -9,14 +9,13 @@
 #include "main/CommandLine.h"
 #include "main/Config.h"
 #include "main/StellarCoreVersion.h"
-#include <regex>
-#include <stdexcept>
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 #include "rust/RustBridge.h"
-#endif
 #include "util/Backtrace.h"
 #include "util/FileSystemException.h"
 #include "util/Logging.h"
+#include <mutex>
+#include <regex>
+#include <stdexcept>
 
 #include "crypto/ShortHash.h"
 #include "util/RandHasher.h"
@@ -26,6 +25,10 @@
 #include <sodium/core.h>
 #include <system_error>
 #include <xdrpp/marshal.h>
+#ifdef USE_TRACY
+#include <Tracy.hpp>
+#include <TracyC.h>
+#endif
 
 namespace stellar
 {
@@ -151,7 +154,6 @@ outOfMemory()
 }
 }
 
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 // We would like this to be a static check but it seems like cxx.rs isn't going
 // to let us export static constants so we do it first thing during startup.
 //
@@ -168,7 +170,16 @@ void
 checkXDRFileIdentity()
 {
     using namespace stellar::rust_bridge;
-    rust::Vec<XDRFileHash> rustHashes = get_xdr_hashes().curr;
+
+    // This will panic if soroban does not support the current ledger protocol
+    // version. It should even work if configured with "next": the next feature
+    // should enable the next feature on the most recent soroban host, and to
+    // select the next xdr module from the xdr crate linked to that host.
+    rust::Vec<SorobanVersionInfo> rustVersions = get_soroban_version_info(
+        stellar::Config::CURRENT_LEDGER_PROTOCOL_VERSION);
+    rust::Vec<XDRFileHash> const& rustHashes =
+        rustVersions.back().xdr_file_hashes;
+
     for (auto const& cpp : stellar::XDR_FILES_SHA256)
     {
         if (cpp.first.empty())
@@ -217,26 +228,104 @@ checkXDRFileIdentity()
 void
 checkStellarCoreMajorVersionProtocolIdentity()
 {
-    auto vers =
+    // This extracts a major version number from the git version string embedded
+    // in the binary if, and only if, that version string has the form of a
+    // release tag: specifically vX.Y.Z, or vX.Y.ZrcN, or vX.Y.ZHOTN. Other
+    // version strings return nullopt, for example non-release-tagged versions
+    // that typically look more like `v21.0.0rc1-84-g08d89bb4a`
+    auto major_release_version =
         stellar::getStellarCoreMajorReleaseVersion(STELLAR_CORE_VERSION);
-    if (vers)
+    if (major_release_version)
     {
-        if (*vers != stellar::Config::CURRENT_LEDGER_PROTOCOL_VERSION)
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+        // In a vNext build, we expect the major release version to be one less
+        // than the CURRENT_LEDGER_PROTOCOL_VERSION. In other words if we are
+        // developing v21.X.Y and we enable vNext, then
+        // CURRENT_LEDGER_PROTOCOL_VERSION should be 22.
+        if (*major_release_version + 1 !=
+            stellar::Config::CURRENT_LEDGER_PROTOCOL_VERSION)
+        {
+            throw std::runtime_error(
+                fmt::format("stellar-core version {} has major version {} and "
+                            "is configured for next-protocol support, but "
+                            "CURRENT_LEDGER_PROTOCOL_VERSION is {}",
+                            STELLAR_CORE_VERSION, *major_release_version,
+                            stellar::Config::CURRENT_LEDGER_PROTOCOL_VERSION));
+        }
+#else
+        // In a non-vNext build, we expect the major release version to be the
+        // same as the CURRENT_LEDGER_PROTOCOL_VERSION. In other words if we are
+        // developing v21.X.Y and we are not enabling vNext, then
+        // CURRENT_LEDGER_PROTOCOL_VERSION should be 21.
+        if (*major_release_version !=
+            stellar::Config::CURRENT_LEDGER_PROTOCOL_VERSION)
         {
             throw std::runtime_error(
                 fmt::format("stellar-core version {} has major version {} but "
                             "CURRENT_LEDGER_PROTOCOL_VERSION is {}",
-                            STELLAR_CORE_VERSION, *vers,
+                            STELLAR_CORE_VERSION, *major_release_version,
                             stellar::Config::CURRENT_LEDGER_PROTOCOL_VERSION));
         }
+#endif
     }
     else
     {
+        // If we are running a version that does not look exactly like vX.Y.Z or
+        // vX.Y.ZrcN or vX.Y.ZHOTN, then we are running a non-release version of
+        // stellar-core and we relax the check above and just warn.
         std::cerr << "Warning: running non-release version "
                   << STELLAR_CORE_VERSION << " of stellar-core" << std::endl;
     }
 }
+
+#ifdef USE_TRACY_MEMORY_TRACKING
+
+#ifdef __has_feature
+#if __has_feature(address_sanitizer)
+#define ASAN_ENABLED
 #endif
+#else
+#ifdef __SANITIZE_ADDRESS__
+#define ASAN_ENABLED
+#endif
+#endif
+
+#ifdef ASAN_ENABLED
+#error "ASAN_ENABLED and USE_TRACY_MEMORY_TRACKING are mutually exclusive"
+#else
+void*
+operator new(std::size_t count)
+{
+    auto ptr = malloc(count);
+    // "Secure" here means "tolerant of calls outside the
+    // lifeitme of the tracy client".
+    TracySecureAlloc(ptr, count);
+    return ptr;
+}
+
+void
+operator delete(void* ptr) noexcept
+{
+    TracySecureFree(ptr);
+    free(ptr);
+}
+
+void*
+operator new[](std::size_t count)
+{
+    auto ptr = malloc(count);
+    TracySecureAlloc(ptr, count);
+    return ptr;
+}
+
+void
+operator delete[](void* ptr) noexcept
+{
+    TracySecureFree(ptr);
+    free(ptr);
+}
+#endif // !ASAN_ENABLED
+#endif // USE_TRACY_MEMORY_TRACKING
 
 int
 main(int argc, char* const* argv)
@@ -249,22 +338,20 @@ main(int argc, char* const* argv)
     // At least print a backtrace in any circumstance
     // that would call std::terminate
     std::set_terminate(printBacktraceAndAbort);
-
     Logging::init();
     if (sodium_init() != 0)
     {
         LOG_FATAL(DEFAULT_LOG, "Could not initialize crypto");
         return 1;
     }
-    shortHash::initialize();
-    randHash::initialize();
+    initializeAllGlobalState();
     xdr::marshaling_stack_limit = 1000;
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+
     checkStellarCoreMajorVersionProtocolIdentity();
-    rust_bridge::check_lockfile_has_expected_dep_trees(
+    rust_bridge::check_sensible_soroban_config_for_protocol(
         Config::CURRENT_LEDGER_PROTOCOL_VERSION);
     checkXDRFileIdentity();
-#endif
 
-    return handleCommandLine(argc, argv);
+    int res = handleCommandLine(argc, argv);
+    return res;
 }

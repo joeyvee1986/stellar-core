@@ -26,6 +26,28 @@ class VerifyLedgerChainWork : public BasicWork
     LedgerRange const mRange;
     uint32_t mCurrCheckpoint;
     LedgerNumHashPair const mLastClosed;
+    // The max ledger number and hash that we have verified up to at some time
+    // in the past (or genesis if we have no previous verification). Invocations
+    // of VerifyLedgerChainWork will verify down to this ledger.
+    std::optional<LedgerNumHashPair> const mMaxPrevVerified;
+
+    // Record any instance where the chain we're verifying disagrees with the
+    // local node state. This _might_ mean we can't possibly catch up (eg. we're
+    // on a too-old core or something) or it _might_ mean we're reading from a
+    // corrupt archive. The next flag differentiates cases.
+    std::optional<HistoryManager::LedgerVerificationStatus>
+        mChainDisagreesWithLocalState;
+
+    // Record whether we were instantiated with an initial head-of-chain hash
+    // that we trust to be the network consensus. If this is true, then any
+    // local-node disagreement is our problem, not a possible corrupt archive,
+    // and we should treat it as an unrecoverable error (i.e. set the promise
+    // below, to stop further catchup-retries).
+    bool mHasTrustedHash{false};
+
+    // Record if archive validity was verified, and core hit an unrecoverable
+    // failure (such as incompatible version)
+    std::promise<bool> mFatalFailurePromise;
 
     // Incoming var to read trusted hash of max ledger from. We use a
     // shared_future here because it allows reading the value multiple
@@ -60,7 +82,9 @@ class VerifyLedgerChainWork : public BasicWork
     VerifyLedgerChainWork(
         Application& app, TmpDir const& downloadDir, LedgerRange const& range,
         LedgerNumHashPair const& lastClosedLedger,
+        std::optional<LedgerNumHashPair> const& maxPrevVerified,
         std::shared_future<LedgerNumHashPair> trustedMaxLedger,
+        std::promise<bool>&& fatalFailure,
         std::shared_ptr<std::ofstream> outputStream = nullptr);
     ~VerifyLedgerChainWork() override = default;
     std::string getStatus() const override;
@@ -82,6 +106,7 @@ class VerifyLedgerChainWork : public BasicWork
 
     BasicWork::State onRun() override;
     void onSuccess() override;
+    void onFailureRaise() override;
     bool
     onAbort() override
     {

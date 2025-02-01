@@ -32,7 +32,10 @@ enum class ProtocolVersion : uint32_t
     V_17,
     V_18,
     V_19,
-    V_20
+    V_20,
+    V_21,
+    V_22,
+    V_23
 };
 
 // Checks whether provided protocolVersion is before (i.e. strictly lower than)
@@ -47,10 +50,7 @@ bool protocolVersionStartsFrom(uint32_t protocolVersion,
 bool protocolVersionEquals(uint32_t protocolVersion,
                            ProtocolVersion equalsVersion);
 
-constexpr ProtocolVersion GENERALIZED_TX_SET_PROTOCOL_VERSION =
-    ProtocolVersion::V_20;
-
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 constexpr ProtocolVersion SOROBAN_PROTOCOL_VERSION = ProtocolVersion::V_20;
-#endif
+constexpr ProtocolVersion PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION =
+    ProtocolVersion::V_23;
 }

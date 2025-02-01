@@ -14,15 +14,9 @@
 namespace stellar
 {
 
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 static int64_t
-calculateDeltaBalance(Hash const& lumenContractID, SCVal const& balanceSymbol,
-                      SCVal const& amountSymbol, LedgerEntry const* current,
-                      LedgerEntry const* previous)
-#else
-static int64_t
-calculateDeltaBalance(LedgerEntry const* current, LedgerEntry const* previous)
-#endif
+calculateDeltaBalance(LumenContractInfo const& lumenContractInfo,
+                      LedgerEntry const* current, LedgerEntry const* previous)
 {
     releaseAssert(current || previous);
     auto let = current ? current->data.type() : previous->data.type();
@@ -77,12 +71,13 @@ calculateDeltaBalance(LedgerEntry const* current, LedgerEntry const* previous)
         }
         return delta;
     }
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case CONTRACT_DATA:
     {
         auto const& contractData = current ? current->data.contractData()
                                            : previous->data.contractData();
-        if (contractData.contractID != lumenContractID ||
+        if (contractData.contract.type() != SC_ADDRESS_TYPE_CONTRACT ||
+            contractData.contract.contractId() !=
+                lumenContractInfo.mLumenContractID ||
             contractData.key.type() != SCV_VEC || !contractData.key.vec() ||
             contractData.key.vec().size() == 0)
         {
@@ -90,12 +85,14 @@ calculateDeltaBalance(LedgerEntry const* current, LedgerEntry const* previous)
         }
 
         // The balanceSymbol should be the first entry in the SCVec
-        if (!(contractData.key.vec()->at(0) == balanceSymbol))
+        if (!(contractData.key.vec()->at(0) ==
+              lumenContractInfo.mBalanceSymbol))
         {
             return 0;
         }
 
-        auto getAmount = [&amountSymbol](LedgerEntry const* entry) -> int64_t {
+        auto getAmount =
+            [&lumenContractInfo](LedgerEntry const* entry) -> int64_t {
             if (!entry)
             {
                 return 0;
@@ -106,7 +103,7 @@ calculateDeltaBalance(LedgerEntry const* current, LedgerEntry const* previous)
             if (val.type() == SCV_MAP && val.map() && val.map()->size() != 0)
             {
                 auto const& amountEntry = val.map()->at(0);
-                if (amountEntry.key == amountSymbol)
+                if (amountEntry.key == lumenContractInfo.mAmountSymbol)
                 {
                     if (amountEntry.val.type() == SCV_I128)
                     {
@@ -131,24 +128,17 @@ calculateDeltaBalance(LedgerEntry const* current, LedgerEntry const* previous)
         break;
     case CONFIG_SETTING:
         break;
-#endif
+    case TTL:
+        break;
     }
     return 0;
 }
 
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 static int64_t
 calculateDeltaBalance(
-    Hash const& lumenContractID, SCVal const& balanceSymbol,
-    SCVal const& amountSymbol,
+    LumenContractInfo const& lumenContractInfo,
     std::shared_ptr<InternalLedgerEntry const> const& genCurrent,
     std::shared_ptr<InternalLedgerEntry const> const& genPrevious)
-#else
-static int64_t
-calculateDeltaBalance(
-    std::shared_ptr<InternalLedgerEntry const> const& genCurrent,
-    std::shared_ptr<InternalLedgerEntry const> const& genPrevious)
-#endif
 {
     auto type = genCurrent ? genCurrent->type() : genPrevious->type();
     if (type == InternalLedgerEntryType::LEDGER_ENTRY)
@@ -157,64 +147,27 @@ calculateDeltaBalance(
         auto const* previous =
             genPrevious ? &genPrevious->ledgerEntry() : nullptr;
 
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-        return calculateDeltaBalance(lumenContractID, balanceSymbol,
-                                     amountSymbol, current, previous);
-#else
-        return calculateDeltaBalance(current, previous);
-#endif
+        return calculateDeltaBalance(lumenContractInfo, current, previous);
     }
     return 0;
 }
 
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-ConservationOfLumens::ConservationOfLumens(Hash const& lumenContractID,
-                                           SCVal const& balanceSymbol,
-                                           SCVal const& amountSymbol)
-    : Invariant(false)
-    , mLumenContractID(lumenContractID)
-    , mBalanceSymbol(balanceSymbol)
-    , mAmountSymbol(amountSymbol)
+ConservationOfLumens::ConservationOfLumens(
+    LumenContractInfo const& lumenContractInfo)
+    : Invariant(false), mLumenContractInfo(lumenContractInfo)
 {
 }
-#else
-ConservationOfLumens::ConservationOfLumens() : Invariant(false)
-{
-}
-#endif
 
 std::shared_ptr<Invariant>
 ConservationOfLumens::registerInvariant(Application& app)
 {
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     // We need to keep track of lumens in the Stellar Asset Contract, so
-    // calculate the lumen contractID the key of the Balance entry, and the
+    // calculate the lumen contractID, the key of the Balance entry, and the
     // amount field within that entry.
-
-    // Calculate contractID
-    HashIDPreimage preImage;
-    preImage.type(ENVELOPE_TYPE_CONTRACT_ID_FROM_ASSET);
-    preImage.fromAsset().networkID = sha256(app.getConfig().NETWORK_PASSPHRASE);
-
-    Asset native;
-    native.type(ASSET_TYPE_NATIVE);
-    preImage.fromAsset().asset = native;
-
-    auto lumenContractID = xdrSha256(preImage);
-
-    // Calculate SCVal for balance key
-    SCVal balanceSymbol(SCV_SYMBOL);
-    balanceSymbol.sym() = "Balance";
-
-    // Calculate SCVal for amount key
-    SCVal amountSymbol(SCV_SYMBOL);
-    amountSymbol.sym() = "amount";
+    auto lumenInfo = getLumenContractInfo(app.getNetworkID());
 
     return app.getInvariantManager().registerInvariant<ConservationOfLumens>(
-        lumenContractID, balanceSymbol, amountSymbol);
-#else
-    return app.getInvariantManager().registerInvariant<ConservationOfLumens>();
-#endif
+        lumenInfo);
 }
 
 std::string
@@ -236,14 +189,9 @@ ConservationOfLumens::checkOnOperationApply(Operation const& operation,
     int64_t deltaBalances = std::accumulate(
         ltxDelta.entry.begin(), ltxDelta.entry.end(), static_cast<int64_t>(0),
         [this](int64_t lhs, decltype(ltxDelta.entry)::value_type const& rhs) {
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-            return lhs + stellar::calculateDeltaBalance(
-                             mLumenContractID, mBalanceSymbol, mAmountSymbol,
-                             rhs.second.current, rhs.second.previous);
-#else
-            return lhs + stellar::calculateDeltaBalance(rhs.second.current,
+            return lhs + stellar::calculateDeltaBalance(mLumenContractInfo,
+                                                        rhs.second.current,
                                                         rhs.second.previous);
-#endif
         });
 
     if (result.tr().type() == INFLATION)

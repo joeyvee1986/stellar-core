@@ -4,41 +4,50 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "xdr/Stellar-transaction.h"
-#include <medida/metrics_registry.h>
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 #include "rust/RustBridge.h"
 #include "transactions/OperationFrame.h"
+#include "xdr/Stellar-transaction.h"
+#include <medida/metrics_registry.h>
 
 namespace stellar
 {
 class AbstractLedgerTxn;
+class MutableTransactionResultBase;
+
+static constexpr ContractDataDurability CONTRACT_INSTANCE_ENTRY_DURABILITY =
+    ContractDataDurability::PERSISTENT;
 
 class InvokeHostFunctionOpFrame : public OperationFrame
 {
     InvokeHostFunctionResult&
-    innerResult()
+    innerResult(OperationResult& res) const
     {
-        return mResult.tr().invokeHostFunctionResult();
+        return res.tr().invokeHostFunctionResult();
     }
 
     void maybePopulateDiagnosticEvents(Config const& cfg,
-                                       InvokeHostFunctionOutput const& output);
+                                       InvokeHostFunctionOutput const& output,
+                                       HostFunctionMetrics const& metrics,
+                                       SorobanTxData& sorobanData) const;
 
     InvokeHostFunctionOp const& mInvokeHostFunction;
 
   public:
-    InvokeHostFunctionOpFrame(Operation const& op, OperationResult& res,
-                              TransactionFrame& parentTx);
-
-    ThresholdLevel getThresholdLevel() const override;
+    InvokeHostFunctionOpFrame(Operation const& op,
+                              TransactionFrame const& parentTx);
 
     bool isOpSupported(LedgerHeader const& header) const override;
 
-    bool doApply(AbstractLedgerTxn& ltx) override;
-    bool doApply(AbstractLedgerTxn& ltx, Config const& cfg,
-                 medida::MetricsRegistry& metrics) override;
-    bool doCheckValid(uint32_t ledgerVersion) override;
+    bool doApply(AppConnector& app, AbstractLedgerTxn& ltx,
+                 Hash const& sorobanBasePrngSeed, OperationResult& res,
+                 std::shared_ptr<SorobanTxData> sorobanData) const override;
+
+    bool doCheckValidForSoroban(SorobanNetworkConfig const& networkConfig,
+                                Config const& appConfig, uint32_t ledgerVersion,
+                                OperationResult& res,
+                                SorobanTxData& sorobanData) const override;
+    bool doCheckValid(uint32_t ledgerVersion,
+                      OperationResult& res) const override;
 
     void
     insertLedgerKeysToPrefetch(UnorderedSet<LedgerKey>& keys) const override;
@@ -52,4 +61,3 @@ class InvokeHostFunctionOpFrame : public OperationFrame
     virtual bool isSoroban() const override;
 };
 }
-#endif // ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION

@@ -19,38 +19,43 @@ class TxQueueLimiter
     uint32 const mPoolLedgerMultiplier;
     LedgerManager& mLedgerManager;
 
-    UnorderedMap<TransactionFrameBasePtr, TxStackPtr> mStackForTx;
-
     // all known transactions
     std::unique_ptr<SurgePricingPriorityQueue> mTxs;
 
     // When non-nullopt, limit the number dex operations by this value
-    std::optional<uint32_t> mMaxDexOperations;
+    std::optional<Resource> mMaxDexOperations;
 
-    // Stores the maximum bid among the transactions evicted from every tx lane.
-    // Bids are stored as ratios (fee_bid / num_ops).
-    std::vector<std::pair<int64, uint32_t>> mLaneEvictedFeeBid;
+    // Stores the maximum inclusion fee among the transactions evicted from
+    // every tx lane. Inclusion fees are stored as ratios (fee_bid / num_ops).
+    std::vector<std::pair<int64, uint32_t>> mLaneEvictedInclusionFee;
 
     // Configuration of SurgePricingPriorityQueue with the per-lane operation
     // limits.
     std::shared_ptr<SurgePricingLaneConfig> mSurgePricingLaneConfig;
 
+    Application& mApp;
+    bool const mIsSoroban;
+
   public:
-    TxQueueLimiter(uint32 multiplier, Application& app);
+    TxQueueLimiter(uint32 multiplier, Application& app, bool isSoroban);
     ~TxQueueLimiter();
 
     void addTransaction(TransactionFrameBasePtr const& tx);
     void removeTransaction(TransactionFrameBasePtr const& tx);
 #ifdef BUILD_TESTS
     size_t size() const;
+    std::pair<bool, int64>
+    canAddTx(TransactionFrameBasePtr const& tx,
+             TransactionFrameBasePtr const& oldTx,
+             std::vector<std::pair<TransactionFrameBasePtr, bool>>& txsToEvict);
 #endif
-    uint32_t maxQueueSizeOps() const;
+    Resource maxScaledLedgerResources(bool isSoroban) const;
 
     // Evict `txsToEvict` from the limiter by calling `evict`.
     // `txsToEvict` should be provided by the `canAddTx` call.
     // Note that evict must call `removeTransaction` as to make space.
     void evictTransactions(
-        std::vector<std::pair<TxStackPtr, bool>> const& txsToEvict,
+        std::vector<std::pair<TransactionFrameBasePtr, bool>> const& txsToEvict,
         TransactionFrameBase const& txToFit,
         std::function<void(TransactionFrameBasePtr const&)> evict);
 
@@ -67,12 +72,13 @@ class TxQueueLimiter
     std::pair<bool, int64>
     canAddTx(TransactionFrameBasePtr const& tx,
              TransactionFrameBasePtr const& oldTx,
-             std::vector<std::pair<TxStackPtr, bool>>& txsToEvict);
+             std::vector<std::pair<TransactionFrameBasePtr, bool>>& txsToEvict,
+             uint32_t ledgerVersion);
 
     // Resets the state related to evictions (maximum evicted bid).
     void resetEvictionState();
 
     // Resets the internal transaction container and the eviction state.
-    void reset();
+    void reset(uint32_t ledgerVersion);
 };
 }

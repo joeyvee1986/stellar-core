@@ -13,6 +13,8 @@
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
 #include "main/ErrorMessages.h"
+#include "overlay/OverlayManager.h"
+#include "overlay/SurveyManager.h"
 #include "scp/SCP.h"
 #include "scp/Slot.h"
 #include "util/Logging.h"
@@ -23,6 +25,7 @@
 #include "xdr/Stellar-ledger.h"
 #include <Tracy.hpp>
 #include <algorithm>
+#include <cmath>
 #include <fmt/format.h>
 #include <medida/metrics_registry.h>
 #include <numeric>
@@ -111,7 +114,7 @@ class SCPHerderEnvelopeWrapper : public SCPEnvelopeWrapper
     HerderImpl& mHerder;
 
     SCPQuorumSetPtr mQSet;
-    std::vector<TxSetFrameConstPtr> mTxSets;
+    std::vector<TxSetXDRFrameConstPtr> mTxSets;
 
   public:
     explicit SCPHerderEnvelopeWrapper(SCPEnvelope const& e, HerderImpl& herder)
@@ -198,8 +201,9 @@ SCPDriver::ValidationLevel
 HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
                                      bool nomination) const
 {
-    uint64_t lastCloseTime;
     ZoneScoped;
+    uint64_t lastCloseTime;
+    releaseAssert(threadIsMain());
     if (b.ext.v() != STELLAR_VALUE_SIGNED)
     {
         CLOG_TRACE(Herder,
@@ -217,15 +221,15 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
         }
     }
 
-    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader().header;
+    auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
     // when checking close time, start with what we have locally
-    lastCloseTime = lcl.scpValue.closeTime;
+    lastCloseTime = lcl.header.scpValue.closeTime;
 
     // if this value is not for our local state,
     // perform as many checks as we can
-    if (slotIndex != (lcl.ledgerSeq + 1))
+    if (slotIndex != (lcl.header.ledgerSeq + 1))
     {
-        if (slotIndex == lcl.ledgerSeq)
+        if (slotIndex == lcl.header.ledgerSeq)
         {
             // previous ledger
             if (b.closeTime != lastCloseTime)
@@ -236,7 +240,7 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
                 return SCPDriver::kInvalidValue;
             }
         }
-        else if (slotIndex < lcl.ledgerSeq)
+        else if (slotIndex < lcl.header.ledgerSeq)
         {
             // basic sanity check on older value
             if (b.closeTime >= lastCloseTime)
@@ -306,7 +310,7 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
     }
 
     Hash const& txSetHash = b.txSetHash;
-    TxSetFrameConstPtr txSet = mPendingEnvelopes.getTxSet(txSetHash);
+    TxSetXDRFrameConstPtr txSet = mPendingEnvelopes.getTxSet(txSetHash);
 
     SCPDriver::ValidationLevel res;
 
@@ -319,7 +323,7 @@ HerderSCPDriver::validateValueHelper(uint64_t slotIndex, StellarValue const& b,
 
         res = SCPDriver::kInvalidValue;
     }
-    else if (!checkAndCacheTxSetValid(txSet, closeTimeOffset))
+    else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset))
     {
         CLOG_DEBUG(Herder,
                    "HerderSCPDriver::validateValue i: {} invalid txSet {}",
@@ -357,8 +361,6 @@ HerderSCPDriver::validateValue(uint64_t slotIndex, Value const& value,
         validateValueHelper(slotIndex, b, nomination);
     if (res != SCPDriver::kInvalidValue)
     {
-        auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
-
         LedgerUpgradeType lastUpgradeType = LEDGER_UPGRADE_VERSION;
 
         // check upgrades
@@ -367,7 +369,7 @@ HerderSCPDriver::validateValue(uint64_t slotIndex, Value const& value,
         {
             LedgerUpgradeType thisUpgradeType;
             if (!mUpgrades.isValid(b.upgrades[i], thisUpgradeType, nomination,
-                                   mApp, lcl.header))
+                                   mApp))
             {
                 CLOG_TRACE(Herder,
                            "HerderSCPDriver::validateValue invalid step at "
@@ -416,14 +418,11 @@ HerderSCPDriver::extractValidValue(uint64_t slotIndex, Value const& value)
     if (validateValueHelper(slotIndex, b, true) ==
         SCPDriver::kFullyValidatedValue)
     {
-        auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
-
         // remove the upgrade steps we don't like
         LedgerUpgradeType thisUpgradeType;
         for (auto it = b.upgrades.begin(); it != b.upgrades.end();)
         {
-            if (!mUpgrades.isValid(*it, thisUpgradeType, true, mApp,
-                                   lcl.header))
+            if (!mUpgrades.isValid(*it, thisUpgradeType, true, mApp))
             {
                 it = b.upgrades.erase(it);
             }
@@ -561,28 +560,21 @@ HerderSCPDriver::stopTimer(uint64 slotIndex, int timerID)
 // returns true if l < r
 // lh, rh are the hashes of l,h
 static bool
-compareTxSets(TxSetFrameConstPtr l, TxSetFrameConstPtr r, Hash const& lh,
-              Hash const& rh, LedgerHeader const& header, Hash const& s)
+compareTxSets(ApplicableTxSetFrame const& l, ApplicableTxSetFrame const& r,
+              Hash const& lh, Hash const& rh, size_t lEncodedSize,
+              size_t rEncodedSize, LedgerHeader const& header, Hash const& s)
 {
-    if (l == nullptr)
-    {
-        return r != nullptr;
-    }
-    if (r == nullptr)
-    {
-        return false;
-    }
-    auto lSize = l->size(header);
-    auto rSize = r->size(header);
+    auto lSize = l.size(header);
+    auto rSize = r.size(header);
     if (lSize != rSize)
     {
         return lSize < rSize;
     }
     if (protocolVersionStartsFrom(header.ledgerVersion,
-                                  GENERALIZED_TX_SET_PROTOCOL_VERSION))
+                                  SOROBAN_PROTOCOL_VERSION))
     {
-        auto lBids = l->getTotalBids();
-        auto rBids = r->getTotalBids();
+        auto lBids = l.getTotalInclusionFees();
+        auto rBids = r.getTotalInclusionFees();
         if (lBids != rBids)
         {
             return lBids < rBids;
@@ -590,18 +582,16 @@ compareTxSets(TxSetFrameConstPtr l, TxSetFrameConstPtr r, Hash const& lh,
     }
     if (protocolVersionStartsFrom(header.ledgerVersion, ProtocolVersion::V_11))
     {
-        auto lFee = l->getTotalFees(header);
-        auto rFee = r->getTotalFees(header);
+        auto lFee = l.getTotalFees(header);
+        auto rFee = r.getTotalFees(header);
         if (lFee != rFee)
         {
             return lFee < rFee;
         }
     }
     if (protocolVersionStartsFrom(header.ledgerVersion,
-                                  GENERALIZED_TX_SET_PROTOCOL_VERSION))
+                                  SOROBAN_PROTOCOL_VERSION))
     {
-        auto lEncodedSize = l->encodedSize();
-        auto rEncodedSize = r->encodedSize();
         if (lEncodedSize != rEncodedSize)
         {
             // Look for the smallest encoded size.
@@ -623,6 +613,8 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
 
     std::set<TransactionFramePtr> aggSet;
 
+    releaseAssert(!mLedgerManager.isApplying());
+    releaseAssert(threadIsMain());
     auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
 
     Hash candidatesHash;
@@ -673,6 +665,29 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
                     clUpgrade.newBaseReserve() = std::max(
                         clUpgrade.newBaseReserve(), lupgrade.newBaseReserve());
                     break;
+                case LEDGER_UPGRADE_FLAGS:
+                    clUpgrade.newFlags() =
+                        std::max(clUpgrade.newFlags(), lupgrade.newFlags());
+                    break;
+                case LEDGER_UPGRADE_CONFIG:
+                    if (clUpgrade.newConfig().contractID <
+                        lupgrade.newConfig().contractID)
+                    {
+                        clUpgrade.newConfig() = lupgrade.newConfig();
+                    }
+                    else if (clUpgrade.newConfig().contractID ==
+                                 lupgrade.newConfig().contractID &&
+                             clUpgrade.newConfig().contentHash <
+                                 lupgrade.newConfig().contentHash)
+                    {
+                        clUpgrade.newConfig() = lupgrade.newConfig();
+                    }
+                    break;
+                case LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE:
+                    clUpgrade.newMaxSorobanTxSetSize() =
+                        std::max(clUpgrade.newMaxSorobanTxSetSize(),
+                                 lupgrade.newMaxSorobanTxSetSize());
+                    break;
                 default:
                     // should never get there with values that are not valid
                     throw std::runtime_error("invalid upgrade step");
@@ -685,21 +700,33 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
     // take the txSet with the biggest size, highest xored hash that we have
     {
         auto highest = candidateValues.cend();
-        TxSetFrameConstPtr highestTxSet;
+        TxSetXDRFrameConstPtr highestTxSet;
+        ApplicableTxSetFrameConstPtr highestApplicableTxSet;
         for (auto it = candidateValues.cbegin(); it != candidateValues.cend();
              ++it)
         {
             auto const& sv = *it;
-            auto const cTxSet = mPendingEnvelopes.getTxSet(sv.txSetHash);
-            if (cTxSet && cTxSet->previousLedgerHash() == lcl.hash &&
-                (!highestTxSet ||
-                 compareTxSets(highestTxSet, cTxSet, highest->txSetHash,
-                               sv.txSetHash, lcl.header, candidatesHash)))
+            auto cTxSet = mPendingEnvelopes.getTxSet(sv.txSetHash);
+            releaseAssert(cTxSet);
+            // Only valid applicable tx sets should be combined.
+            auto cApplicableTxSet = cTxSet->prepareForApply(mApp);
+            releaseAssert(cApplicableTxSet);
+            if (cTxSet->previousLedgerHash() == lcl.hash)
             {
-                highest = it;
-                highestTxSet = cTxSet;
+
+                if (!highestTxSet ||
+                    compareTxSets(*highestApplicableTxSet, *cApplicableTxSet,
+                                  highest->txSetHash, sv.txSetHash,
+                                  highestTxSet->encodedSize(),
+                                  cTxSet->encodedSize(), lcl.header,
+                                  candidatesHash))
+                {
+                    highest = it;
+                    highestTxSet = cTxSet;
+                    highestApplicableTxSet = std::move(cApplicableTxSet);
+                }
             }
-        };
+        }
         if (highest == candidateValues.cend())
         {
             throw std::runtime_error(
@@ -844,7 +871,7 @@ HerderSCPDriver::logQuorumInformationAndUpdateMetrics(uint64_t index)
 
 void
 HerderSCPDriver::nominate(uint64_t slotIndex, StellarValue const& value,
-                          TxSetFrameConstPtr proposedSet,
+                          TxSetXDRFrameConstPtr proposedSet,
                           StellarValue const& previousValue)
 {
     ZoneScoped;
@@ -855,7 +882,7 @@ HerderSCPDriver::nominate(uint64_t slotIndex, StellarValue const& value,
     CLOG_DEBUG(Herder,
                "HerderSCPDriver::triggerNextLedger txSet.size: {} "
                "previousLedgerHash: {} value: {} slot: {}",
-               proposedSet->sizeTx(),
+               proposedSet->sizeTxTotal(),
                hexAbbrev(proposedSet->previousLedgerHash()),
                hexAbbrev(valueHash), slotIndex);
 
@@ -1008,6 +1035,13 @@ HerderSCPDriver::recordSCPExternalizeEvent(uint64_t slotIndex, NodeID const& id,
                             mSCPMetrics.mFirstToSelfExternalizeLag,
                             "first to self externalize lag",
                             std::chrono::nanoseconds::zero(), slotIndex);
+            mApp.getOverlayManager().getSurveyManager().modifyNodeData(
+                [&](CollectingNodeData& nd) {
+                    nd.mSCPFirstToSelfLatencyMsHistogram.Update(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - *timing.mFirstExternalize)
+                            .count());
+                });
         }
         if (!timing.mSelfExternalize || forceUpdateSelf)
         {
@@ -1026,6 +1060,13 @@ HerderSCPDriver::recordSCPExternalizeEvent(uint64_t slotIndex, NodeID const& id,
                 fmt::format(FMT_STRING("self to {} externalize lag"),
                             toShortString(id)),
                 std::chrono::nanoseconds::zero(), slotIndex);
+            mApp.getOverlayManager().getSurveyManager().modifyNodeData(
+                [&](CollectingNodeData& nd) {
+                    nd.mSCPSelfToOtherLatencyMsHistogram.Update(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - *timing.mFirstExternalize)
+                            .count());
+                });
         }
 
         // Record lag for other nodes
@@ -1145,7 +1186,7 @@ class SCPHerderValueWrapper : public ValueWrapper
 {
     HerderImpl& mHerder;
 
-    TxSetFrameConstPtr mTxSet;
+    TxSetXDRFrameConstPtr mTxSet;
 
   public:
     explicit SCPHerderValueWrapper(StellarValue const& sv, Value const& value,
@@ -1187,17 +1228,41 @@ HerderSCPDriver::wrapStellarValue(StellarValue const& sv)
 }
 
 bool
-HerderSCPDriver::checkAndCacheTxSetValid(TxSetFrameConstPtr txSet,
+HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
+                                         LedgerHeaderHistoryEntry const& lcl,
                                          uint64_t closeTimeOffset) const
 {
-    auto key = TxSetValidityKey{
-        mApp.getLedgerManager().getLastClosedLedgerHeader().hash,
-        txSet->getContentsHash(), closeTimeOffset, closeTimeOffset};
+    auto key = TxSetValidityKey{lcl.hash, txSet.getContentsHash(),
+                                closeTimeOffset, closeTimeOffset};
 
     bool* pRes = mTxSetValidCache.maybeGet(key);
     if (pRes == nullptr)
     {
-        bool res = txSet->checkValid(mApp, closeTimeOffset, closeTimeOffset);
+        // The invariant here is that we only validate tx sets nominated
+        // to be applied to the current ledger state. However, in case
+        // if we receive a bad SCP value for the current state, we still
+        // might end up with malformed tx set that doesn't refer to the
+        // LCL.
+        ApplicableTxSetFrameConstPtr applicableTxSet;
+        if (txSet.previousLedgerHash() == lcl.hash)
+        {
+            applicableTxSet = txSet.prepareForApply(mApp);
+        }
+
+        bool res = true;
+        if (applicableTxSet == nullptr)
+        {
+            CLOG_ERROR(
+                Herder, "validateValue i:{} can't prepare txSet {} for apply",
+                (lcl.header.ledgerSeq + 1), hexAbbrev(txSet.getContentsHash()));
+            res = false;
+        }
+        else
+        {
+            res = applicableTxSet->checkValid(mApp, closeTimeOffset,
+                                              closeTimeOffset);
+        }
+
         mTxSetValidCache.put(key, res);
         return res;
     }
@@ -1216,5 +1281,73 @@ HerderSCPDriver::TxSetValidityKeyHash::operator()(
     hashMix(res, std::get<2>(key));
     hashMix(res, std::get<3>(key));
     return res;
+}
+
+uint64
+HerderSCPDriver::getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
+                               bool const isLocalNode) const
+{
+    releaseAssert(!mLedgerManager.isApplying());
+    Config const& cfg = mApp.getConfig();
+    bool const unsupportedProtocol = protocolVersionIsBefore(
+        mApp.getLedgerManager()
+            .getLastClosedLedgerHeader()
+            .header.ledgerVersion,
+        APPLICATION_SPECIFIC_NOMINATION_LEADER_ELECTION_PROTOCOL_VERSION);
+    if (unsupportedProtocol || !cfg.VALIDATOR_WEIGHT_CONFIG.has_value() ||
+        cfg.FORCE_OLD_STYLE_LEADER_ELECTION)
+    {
+        // Fall back on old weight algorithm if any of the following are true:
+        // 1. The network has not yet upgraded to
+        //    APPLICATION_SPECIFIC_NOMINATION_LEADER_ELECTION_PROTOCOL_VERSION,
+        // 2. The node is using manual quorum set configuration, or
+        // 3. The node has the FORCE_OLD_STYLE_LEADER_ELECTION flag
+        //    set
+        return SCPDriver::getNodeWeight(nodeID, qset, isLocalNode);
+    }
+
+    ValidatorWeightConfig const& vwc =
+        mApp.getConfig().VALIDATOR_WEIGHT_CONFIG.value();
+
+    auto entryIt = vwc.mValidatorEntries.find(nodeID);
+    if (entryIt == vwc.mValidatorEntries.end())
+    {
+        // This shouldn't be possible as the validator entries should contain
+        // all validators in the config. For this to happen, `getNodeWeight`
+        // would have to be called with a non-validator `nodeID`. Throw if
+        // building tests, and otherwise fall back on the old algorithm.
+        throw std::runtime_error(
+            fmt::format(FMT_STRING("Validator entry not found for node {}"),
+                        toShortString(nodeID)));
+    }
+
+    ValidatorEntry const& entry = entryIt->second;
+    auto homeDomainSizeIt = vwc.mHomeDomainSizes.find(entry.mHomeDomain);
+    if (homeDomainSizeIt == vwc.mHomeDomainSizes.end())
+    {
+        // This shouldn't be possible as the home domain sizes should contain
+        // all home domains in the config. For this to happen, `getNodeWeight`
+        // would have to be called with a non-validator, or the config parser
+        // would have to allow a validator without a home domain. Throw if
+        // building tests, and otherwise fall back on the old algorithm.
+        throw std::runtime_error(
+            fmt::format(FMT_STRING("Home domain size not found for domain {}"),
+                        entry.mHomeDomain));
+    }
+
+    auto qualityWeightIt = vwc.mQualityWeights.find(entry.mQuality);
+    if (qualityWeightIt == vwc.mQualityWeights.end())
+    {
+        // This shouldn't be possible as the quality weights should contain all
+        // quality levels in the config.
+        throw std::runtime_error(
+            fmt::format(FMT_STRING("Quality weight not found for quality {}"),
+                        static_cast<int>(entry.mQuality)));
+    }
+
+    // Node's weight is its quality's weight divided by the number of nodes in
+    // its home domain
+    releaseAssert(homeDomainSizeIt->second > 0);
+    return qualityWeightIt->second / homeDomainSizeIt->second;
 }
 }

@@ -20,7 +20,7 @@ using namespace stellar::txtest;
 
 TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
 {
-    Config cfg(getTestConfig(0, Config::TESTDB_DEFAULT));
+    Config cfg(getTestConfig());
     cfg.MANUAL_CLOSE = false;
 
     VirtualClock clock;
@@ -30,14 +30,20 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
     cfg.QUORUM_SET.validators.emplace_back(s.getPublicKey());
     Application::pointer app = createTestApplication(clock, cfg);
 
-    auto const& lcl = app->getLedgerManager().getLastClosedLedgerHeader();
+    auto const lcl = app->getLedgerManager().getLastClosedLedgerHeader();
 
     auto& herder = static_cast<HerderImpl&>(app->getHerder());
 
     auto root = TestAccount::createRoot(*app);
-    auto a1 = TestAccount{*app, getAccount("A")};
-    using TxPair = std::pair<Value, TxSetFrameConstPtr>;
-    auto makeTxPair = [&](TxSetFrameConstPtr txSet, uint64_t closeTime,
+    size_t numAccounts = 50;
+    std::vector<TestAccount> accs;
+    for (size_t i = 0; i < numAccounts; i++)
+    {
+        accs.push_back(TestAccount{*app, getAccount("A" + std::to_string(i))});
+    }
+
+    using TxPair = std::pair<Value, TxSetXDRFrameConstPtr>;
+    auto makeTxPair = [&](TxSetXDRFrameConstPtr txSet, uint64_t closeTime,
                           StellarValueType svt) {
         StellarValue sv = herder.makeStellarValue(
             txSet->getContentsHash(), closeTime, emptyUpgradeSteps, s);
@@ -61,11 +67,13 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
         herder.signEnvelope(s, envelope);
         return envelope;
     };
-    auto makeTransactions = [&](Hash hash, int n) {
+    size_t index = 0;
+    auto makeTransactions = [&](Hash hash, size_t n) {
+        REQUIRE(n <= accs.size());
         std::vector<TransactionFrameBasePtr> txs(n);
         std::generate(std::begin(txs), std::end(txs),
-                      [&]() { return root.tx({createAccount(a1, 10000000)}); });
-        return TxSetFrame::makeFromTransactions(txs, *app, 0, 0);
+                      [&]() { return accs[index++].tx({payment(root, 1)}); });
+        return makeTxSetFromTransactions(txs, *app, 0, 0).first;
     };
 
     auto makePublicKey = [](int i) {
@@ -102,7 +110,7 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
     }
     auto bigQSetHash = sha256(xdr::xdr_to_opaque(bigQSet));
 
-    auto txSet = makeTransactions(lcl.hash, 50);
+    auto txSet = makeTransactions(lcl.hash, numAccounts);
     auto p = makeTxPair(txSet, 10, STELLAR_VALUE_SIGNED);
     auto saneEnvelope = makeEnvelope(p, saneQSetHash, lcl.header.ledgerSeq + 1);
     auto bigEnvelope = makeEnvelope(p, bigQSetHash, lcl.header.ledgerSeq + 1);
@@ -254,9 +262,10 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
         REQUIRE(pendingEnvelopes.recvSCPEnvelope(saneEnvelope) ==
                 Herder::ENVELOPE_STATUS_PROCESSED);
 
-        auto lcl = app->getLedgerManager().getLastClosedLedgerNum();
+        auto lclNum = app->getLedgerManager().getLastClosedLedgerNum();
         auto lastCheckpointSeq =
-            app->getHistoryManager().lastLedgerBeforeCheckpointContaining(lcl);
+            HistoryManager::lastLedgerBeforeCheckpointContaining(
+                lclNum, app->getConfig());
 
         SECTION("with slotIndex difference less or equal than "
                 "MAX_SLOTS_TO_REMEMBER")
@@ -277,8 +286,8 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
 
         SECTION("with slotIndex difference bigger than MAX_SLOTS_TO_REMEMBER")
         {
-            auto minSlot = saneEnvelope3.statement.slotIndex -
-                           app->getConfig().MAX_SLOTS_TO_REMEMBER;
+            auto const minSlot = saneEnvelope3.statement.slotIndex -
+                                 app->getConfig().MAX_SLOTS_TO_REMEMBER;
             pendingEnvelopes.eraseBelow(minSlot, lastCheckpointSeq);
             auto saneQSetP = pendingEnvelopes.getQSet(saneQSetHash);
 
@@ -335,8 +344,7 @@ TEST_CASE("PendingEnvelopes recvSCPEnvelope", "[herder]")
     SECTION("can receive malformed tx set")
     {
         GeneralizedTransactionSet malformedXdrSet(1);
-        auto malformedTxSet =
-            TxSetFrame::makeFromWire(app->getNetworkID(), malformedXdrSet);
+        auto malformedTxSet = TxSetXDRFrame::makeFromWire(malformedXdrSet);
         auto p2 = makeTxPair(malformedTxSet, 10, STELLAR_VALUE_SIGNED);
         auto malformedEnvelope =
             makeEnvelope(p2, saneQSetHash, lcl.header.ledgerSeq + 1);

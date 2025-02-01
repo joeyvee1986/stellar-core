@@ -6,11 +6,11 @@
 #include "invariant/InvariantManager.h"
 #include "ledger/LedgerTxn.h"
 #include "main/Application.h"
-#include "transactions/TransactionUtils.h"
 #include "util/GlobalChecks.h"
 #include "util/ProtocolVersion.h"
 #include "xdr/Stellar-ledger-entries.h"
 #include "xdrpp/printer.h"
+#include <crypto/SHA.h>
 #include <fmt/format.h>
 
 namespace stellar
@@ -22,14 +22,18 @@ signerCompare(Signer const& s1, Signer const& s2)
     return s1.key < s2.key;
 }
 
-LedgerEntryIsValid::LedgerEntryIsValid() : Invariant(false)
+LedgerEntryIsValid::LedgerEntryIsValid(
+    LumenContractInfo const& lumenContractInfo)
+    : Invariant(false), mLumenContractInfo(lumenContractInfo)
 {
 }
 
 std::shared_ptr<Invariant>
 LedgerEntryIsValid::registerInvariant(Application& app)
 {
-    return app.getInvariantManager().registerInvariant<LedgerEntryIsValid>();
+    auto lumenInfo = getLumenContractInfo(app.getNetworkID());
+    return app.getInvariantManager().registerInvariant<LedgerEntryIsValid>(
+        lumenInfo);
 }
 
 std::string
@@ -124,14 +128,14 @@ LedgerEntryIsValid::checkIsValid(LedgerEntry const& le,
             return "LiquidityPool is sponsored";
         }
         return checkIsValid(le.data.liquidityPool(), previous, version);
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
     case CONTRACT_DATA:
         return checkIsValid(le.data.contractData(), previous, version);
     case CONTRACT_CODE:
         return checkIsValid(le.data.contractCode(), previous, version);
     case CONFIG_SETTING:
         return checkIsValid(le.data.configSetting(), previous, version);
-#endif
+    case TTL:
+        return checkIsValid(le.data.ttl(), previous, version);
     default:
         return "LedgerEntry has invalid type";
     }
@@ -491,12 +495,49 @@ LedgerEntryIsValid::checkIsValid(LiquidityPoolEntry const& lp,
     return {};
 }
 
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
 std::string
 LedgerEntryIsValid::checkIsValid(ContractDataEntry const& cde,
                                  LedgerEntry const* previous,
                                  uint32 version) const
 {
+    // Lumen contract validation
+    if (cde.contract.type() == SC_ADDRESS_TYPE_CONTRACT &&
+        cde.contract.contractId() == mLumenContractInfo.mLumenContractID)
+    {
+        // Identify balance entries
+        if (cde.key.type() == SCV_VEC && cde.key.vec() &&
+            !cde.key.vec()->empty() &&
+            cde.key.vec()->at(0) == mLumenContractInfo.mBalanceSymbol)
+        {
+            if (cde.durability != ContractDataDurability::PERSISTENT)
+            {
+                return "Balance entry must be persistent";
+            }
+
+            auto const& val = cde.val;
+            if (val.type() != SCV_MAP || val.map()->size() == 0)
+            {
+                return "Balance entry val must be a populated Map";
+            }
+
+            auto const& amountEntry = val.map()->at(0);
+            if (!(amountEntry.key == mLumenContractInfo.mAmountSymbol))
+            {
+                return "Balance amount symbol is incorrect";
+            }
+            if (amountEntry.val.type() != SCV_I128)
+            {
+                return "Balance amount must be a I128";
+            }
+            auto lo = amountEntry.val.i128().lo;
+            auto hi = amountEntry.val.i128().hi;
+            if (lo > INT64_MAX || hi > 0)
+            {
+                return "Balance amount is invalid";
+            }
+        }
+    }
+
     return {};
 }
 
@@ -505,6 +546,30 @@ LedgerEntryIsValid::checkIsValid(ContractCodeEntry const& cce,
                                  LedgerEntry const* previous,
                                  uint32 version) const
 {
+    if (sha256(cce.code) != cce.hash)
+    {
+        return "Contract code doesn't match hash";
+    }
+
+    if (!previous)
+    {
+        return {};
+    }
+    else if (previous->data.type() != CONTRACT_CODE)
+    {
+        return "ContractCode used to be of different type";
+    }
+
+    auto const& prevCode = previous->data.contractCode();
+    if (cce.hash != prevCode.hash)
+    {
+        return "ContractCode hash modified";
+    }
+
+    if (cce.code != prevCode.code)
+    {
+        return "ContractCode code modified";
+    }
     return {};
 }
 
@@ -513,7 +578,36 @@ LedgerEntryIsValid::checkIsValid(ConfigSettingEntry const& cfg,
                                  LedgerEntry const* previous,
                                  uint32 version) const
 {
+    // ConfigSettingEntry is not affected on operation apply path, so invariants
+    // will not be checked.
     return {};
 }
-#endif
+
+std::string
+LedgerEntryIsValid::checkIsValid(TTLEntry const& te,
+                                 LedgerEntry const* previous,
+                                 uint32_t version) const
+{
+    if (!previous)
+    {
+        return {};
+    }
+
+    if (previous->data.type() != TTL)
+    {
+        return "TTL used to be of different type";
+    }
+
+    if (previous->data.ttl().keyHash != te.keyHash)
+    {
+        return "TTL keyHash modified";
+    }
+
+    if (previous->data.ttl().liveUntilLedgerSeq > te.liveUntilLedgerSeq)
+    {
+        return "TTL liveUntilLedgerSeq decreased";
+    }
+
+    return {};
+}
 }

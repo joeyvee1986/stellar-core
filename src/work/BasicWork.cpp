@@ -80,7 +80,7 @@ std::string
 BasicWork::getStatus() const
 {
     // Work is in `WAITING` state when retrying
-    auto state = mRetryTimer ? InternalState::RETRYING : mState;
+    auto state = mRetryTimer ? InternalState::RETRYING : mState.load();
 
     switch (state)
     {
@@ -392,10 +392,7 @@ BasicWork::crankWork()
 VirtualClock::duration
 BasicWork::getRetryDelay() const
 {
-    // Cap to 512 sec or ~8 minutes
-    uint64_t upperBound = 1ULL << std::min(uint64_t(9), uint64_t(mRetries));
-    uint64_t lowerBound = upperBound < 2 ? uint64_t(1) : (upperBound / 2 + 1);
-    return std::chrono::seconds(rand_uniform<uint64_t>(lowerBound, upperBound));
+    return exponentialBackoff(uint64_t(mRetries));
 }
 
 uint64_t

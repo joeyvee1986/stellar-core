@@ -19,26 +19,25 @@ class TransactionMetaFrame
     void pushTxChangesBefore(LedgerEntryChanges&& changes);
     size_t getNumChangesBefore() const;
     LedgerEntryChanges getChangesBefore() const;
+    LedgerEntryChanges getChangesAfter() const;
     void clearOperationMetas();
     void pushOperationMetas(xdr::xvector<OperationMeta>&& opMetas);
     size_t getNumOperations() const;
     void pushTxChangesAfter(LedgerEntryChanges&& changes);
     void clearTxChangesAfter();
 
-    void setTxResult(TransactionResult const& res);
-    void finalizeHashes();
     TransactionMeta const& getXDR() const;
 
-#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
-    void pushContractEvents(xdr::xvector<OperationEvents>&& events);
-    void pushDiagnosticEvents(xdr::xvector<OperationDiagnosticEvents>&& events);
-    static Hash getHashOfMetaHashes(TransactionMeta const&);
-#endif
+    void pushContractEvents(xdr::xvector<ContractEvent>&& events);
+    void pushDiagnosticEvents(xdr::xvector<DiagnosticEvent>&& events);
+    void setReturnValue(SCVal&& returnValue);
+    void setSorobanFeeInfo(int64_t nonRefundableFeeSpent,
+                           int64_t totalRefundableFeeSpent,
+                           int64_t rentFeeCharged);
 
   private:
     TransactionMeta mTransactionMeta;
     int mVersion;
-    bool mHashesFinalized{false};
 };
 
 }

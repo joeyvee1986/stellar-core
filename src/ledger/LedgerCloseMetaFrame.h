@@ -28,7 +28,13 @@ class LedgerCloseMetaFrame
 
     xdr::xvector<UpgradeEntryMeta>& upgradesProcessing();
 
-    void populateTxSet(TxSetFrame const& txSet);
+    void populateTxSet(TxSetXDRFrame const& txSet);
+
+    // Used for populating meta from background eviction scan
+    void populateEvictedEntries(EvictedStateVectors const& evictedState);
+
+    void setNetworkConfiguration(SorobanNetworkConfig const& networkConfig,
+                                 bool emitExtV1);
 
     LedgerCloseMeta const& getXDR() const;
 
